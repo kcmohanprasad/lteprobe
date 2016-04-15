@@ -1,5 +1,5 @@
 /*-
- D_*   BSD LICENSE
+ *   BSD LICENSE
  * 
  *   Copyright(c) 2010-2014 Intel Corporation. All rights reserved.
  *   All rights reserved.
@@ -38,454 +38,23 @@
  *  Sunil Shaligram  Added GTPv2 support		10th November 2014
  *  Sunil Shaligram  Added parking lot timer support	15th November 2014
  *  Sunil Shaligram  Fixed octet count bug		25th November 2014
+ *  Sunil Shaligram  Added gtp Pkt statistics		16th January 2015
+ *  Sunil Shaligram  Support for fragmented gtp pkts	20th January 2015
+ *  Sunil Shaligram  Support for linux cooked frames	7th April 2015
+ *  Sunil Shaligram  Packet xmit to dpi engine		8th June  2015
+ *  Sunil Shaligram  Support for nDPI			27th June 2015
+ *  Sunil Shaligram  tye req/rsp sessionId -bug	        24th July 2015
+ *  Sunil Shaligram  IDR Creation and dump to csv	27th July 2015
+ *  Sunil Shaligram  Fixed crash if no npdu/n_seq	30th Aug 2015
+ *  Sunil Shaligram  Fixed bug handling dups gtpv2/ipv6	19th Sep 2015
+ *  Sunil Shaligram  Fixed bug handling gtpv2/ipv4 	2nd Feb 2016	
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-#include <inttypes.h>
-#include <sys/types.h>
-#include <sys/queue.h>
-#include <setjmp.h>
-#include <stdarg.h>
-#include <ctype.h>
-#include <errno.h>
-#include <getopt.h>
-#include <sys/time.h>
-
-#include <rte_common.h>
-#include <rte_log.h>
-#include <rte_memory.h>
-#include <rte_memcpy.h>
-#include <rte_memzone.h>
-#include <rte_tailq.h>
-#include <rte_eal.h>
-#include <rte_per_lcore.h>
-#include <rte_launch.h>
-#include <rte_atomic.h>
-#include <rte_cycles.h>
-#include <rte_prefetch.h>
-#include <rte_lcore.h>
-#include <rte_per_lcore.h>
-#include <rte_branch_prediction.h>
-#include <rte_interrupts.h>
-#include <rte_pci.h>
-#include <rte_random.h>
-#include <rte_debug.h>
-#include <rte_ether.h>
-#include <rte_ethdev.h>
-#include <rte_ring.h>
-#include <rte_mempool.h>
-#include <rte_mbuf.h>
-#include <rte_ip.h>
-#include <rte_udp.h>
-#include <rte_byteorder.h>
-#include <rte_ether.h>
-#include <rte_string_fns.h>
-#include <rte_hash.h>
-#include <rte_hash_crc.h>
-#include <rte_malloc.h>
-#include <rte_timer.h>
 
 #include "main.h"
 
-#define RTE_LOGTYPE_L2FWD RTE_LOGTYPE_USER1
-#define  RTE_LIBRTE_IXGBE_DEBUG_RX
-
-#define MBUF_SIZE (2048 + sizeof(struct rte_mbuf) + RTE_PKTMBUF_HEADROOM)
-#define NB_MBUF 4096 
-
-/*
- * RX and TX Prefetch, Host, and Write-back threshold values should be
- * carefully set for optimal performance. Consult the network
- * controller's datasheet and supporting DPDK documentation for guidance
- * on how these parameters should be set.
- */
-#define RX_PTHRESH 8 /**< Default values of RX prefetch threshold reg. */
-#define RX_HTHRESH 8 /**< Default values of RX host threshold reg. */
-#define RX_WTHRESH 4 /**< Default values of RX write-back threshold reg. */
-
-/*
- * These default values are optimized for use with the Intel(R) 82599 10 GbE
- * Controller and the DPDK ixgbe PMD. Consider using other values for other
- * network controllers and/or network drivers.
- */
-#define TX_PTHRESH 36 /**< Default values of TX prefetch threshold reg. */
-#define TX_HTHRESH 0  /**< Default values of TX host threshold reg. */
-#define TX_WTHRESH 0  /**< Default values of TX write-back threshold reg. */
-
-#define MAX_PKT_BURST 32
-#define BURST_TX_DRAIN_US 100 /* TX drain every ~100us */
-
-/*
- * Configurable number of RX/TX ring descriptors
- */
-#define RTE_TEST_RX_DESC_DEFAULT 128
-#define RTE_TEST_TX_DESC_DEFAULT 512
-static uint16_t nb_rxd = RTE_TEST_RX_DESC_DEFAULT;
-static uint16_t nb_txd = RTE_TEST_TX_DESC_DEFAULT;
-
-/*bit manipulation defines*/
-#define ALL_32_BITS 0xffffffff
-#define BIT_8_TO_15 0x0000ff00
-#define BIT_0_TO_15 0x0000ffff
-
-/* ethernet addresses of ports */
-static struct ether_addr l2fwd_ports_eth_addr[RTE_MAX_ETHPORTS];
-
-/* mask of enabled ports */
-static uint32_t l2fwd_enabled_port_mask = 0;
-
-/* list of enabled ports */
-static uint32_t l2fwd_dst_ports[RTE_MAX_ETHPORTS];
-
-static unsigned int l2fwd_rx_queue_per_lcore = 1;
-
-struct mbuf_table {
-	unsigned len;
-	struct rte_mbuf *m_table[MAX_PKT_BURST];
-};
-
-#define MAX_RX_QUEUE_PER_LCORE 16
-#define MAX_TX_QUEUE_PER_PORT 16
-struct lcore_queue_conf {
-	unsigned n_rx_port;
-	unsigned rx_port_list[MAX_RX_QUEUE_PER_LCORE];
-	struct mbuf_table tx_mbufs[RTE_MAX_ETHPORTS];
-
-} __rte_cache_aligned;
-struct lcore_queue_conf lcore_queue_conf[RTE_MAX_LCORE];
-
-static const struct rte_eth_conf port_conf = {
-	.rxmode = {
-		.split_hdr_size = 0,
-		.header_split   = 0, /**< Header Split disabled */
-		.hw_ip_checksum = 0, /**< IP checksum offload disabled */
-		.hw_vlan_filter = 0, /**< VLAN filtering disabled */
-		.jumbo_frame    = 0, /**< Jumbo Frame Support disabled */
-		.hw_strip_crc   = 0, /**< CRC stripped by hardware */
-	},
-	.txmode = {
-		.mq_mode = ETH_MQ_TX_NONE,
-	},
-};
-
-static const struct rte_eth_rxconf rx_conf = {
-	.rx_thresh = {
-		.pthresh = RX_PTHRESH,
-		.hthresh = RX_HTHRESH,
-		.wthresh = RX_WTHRESH,
-	},
-};
-
-static const struct rte_eth_txconf tx_conf = {
-	.tx_thresh = {
-		.pthresh = TX_PTHRESH,
-		.hthresh = TX_HTHRESH,
-		.wthresh = TX_WTHRESH,
-	},
-	.tx_free_thresh = 0, /* Use PMD default values */
-	.tx_rs_thresh = 0, /* Use PMD default values */
-	/*
-	* As the example won't handle mult-segments and offload cases,
-	* set the flag by default.
-	*/
-	.txq_flags = ETH_TXQ_FLAGS_NOMULTSEGS | ETH_TXQ_FLAGS_NOOFFLOADS,
-};
-
 struct rte_mempool * l2fwd_pktmbuf_pool = NULL;
 
-/* Per-port statistics struct */
-struct l2fwd_port_statistics {
-	uint64_t tx;
-	uint64_t rx;
-	uint64_t dropped;
-} __rte_cache_aligned;
-struct l2fwd_port_statistics port_statistics[RTE_MAX_ETHPORTS];
-
-/* A tsc-based timer responsible for triggering statistics printout */
-#define TIMER_MILLISECOND 2000000ULL /* around 1ms at 2 Ghz */
-#define RETRY_TIMEOUT 10000000000ULL /* around 5s at 2 Ghz */
-#define MAX_TIMER_PERIOD 86400 /* 1 day max */
-#define TIMER_RESOLUTION_CYCLES 20000000ULL /* around 10ms at 2 Ghz */
-
-static int64_t timer_period = 10 * TIMER_MILLISECOND * 1000; /* default period is 10 seconds */
-#define IPV6_ADDR_LEN			4	
-
-#define USERPLANE_GTP_PORT		2152
-#define CONTROLPLANE_GTP_PORT		2123
-#define LTEPROBE_HASH_ENTRIES		10*1024*1024	//10 million hash entries
-#define MAX_HASH_OBJECT_PER_REQUEST	100		//queue upto 100 entries in the sessionId ring before deleting buffers.
-#define DELETE_GTPV1_SESSION_NO_TEARDOWN	0x00
-#define ADD_GTPV1_SESSION		0x01
-#define DELETE_GTPV1_SESSION_TEARDOWN	0x02
-#define ADD_GTPV2_SESSION               0x03
-#define ADD_BEARER_GTPV2_SESSION        0x04
-
-
-
-static struct timeval start_time;
-static uint64_t start_cycles;
-static uint64_t hz;
-
-struct LteInfoAppend {
-	uint64_t fragmentId;
-	uint64_t gtpSessionId;
-	uint64_t microSecondTimeStamp;
-	uint64_t secondTimeStamp;
-	};
-
-struct GtpV1Header {
-        u_int8_t flags;
-        u_int8_t msgtype;
-        u_int16_t length;
-        u_int32_t teid;
-	}__attribute__((__packed__));;
-
-struct GtpV2Header {
-        u_int8_t flags;
-        u_int8_t msgtype;
-        u_int16_t length;
-        u_int32_t teid;
-	u_int32_t seqNumAndspare;
-        }__attribute__((__packed__));;
-
-struct GtpV2Header_noTeid {
-        u_int8_t flags;
-        u_int8_t msgtype;
-        u_int16_t length;
-	u_int32_t seqNumAndspare;
-        }__attribute__((__packed__));;
-
-struct sessionIdIpV4HashObject {
-	uint32_t ipControl;
-	uint32_t ipUser;
-	uint8_t	 ipUserV6[IPV6_ADDR_LEN];
-	uint32_t controlTeid;
-	uint32_t dataTeid;
-	uint64_t sessionId;
-	int	 addDeleteFlag;//0x01 to add 0x00 to delete
-	};
-
-struct sessionIdIpV6HashObject {
-        uint8_t  ipControl[IPV6_ADDR_LEN];
-        uint8_t  ipUser[IPV6_ADDR_LEN];
-	uint32_t ipUserV4;
-        uint32_t controlTeid;
-        uint32_t dataTeid;
-        uint64_t sessionId;
-        int      addDeleteFlag;//0x01 to add 0x00 to delete
-        };
-
-
-struct sessionIdIpV4HashTableContent {
-	uint32_t ipControl;
-	uint32_t ipUser;
-	uint32_t controlTeid;
-	uint32_t userTeid;
-	uint64_t sessionId;
-	uint8_t outputInterface;
-	};
-
-struct sessionIdIpV6HashTableContent {
-        uint8_t  ipControl[IPV6_ADDR_LEN];
-        uint8_t  ipUser[IPV6_ADDR_LEN];
-        uint32_t controlTeid;
-        uint32_t userTeid;
-        uint64_t sessionId;
-        uint8_t  outputInterface;
-        };
-
-
-struct gtpV2IpBearerList {
-	uint8_t	 ipType;
-        uint8_t  ipV6User[IPV6_ADDR_LEN];
-	uint32_t ipV4User;
-        uint32_t userTeid;
-        struct   gtpV2IpBearerList *pNextBearer;
-        };
-
-
-struct sessionIdIpV4GtpV2HashTableContent {
-        uint32_t ipControl;
-        uint32_t controlTeid;
-        uint64_t sessionId;
-	struct   gtpV2IpBearerList *pBearerList;
-        uint8_t  outputInterface;
-        };
-
-struct sessionIdIpV6GtpV2HashTableContent {
-        uint8_t  ipControl[IPV6_ADDR_LEN];
-	struct 	 gtpV2IpBearerList *pBearerList;
-        uint32_t controlTeid;
-        uint64_t sessionId;
-        uint8_t  outputInterface;
-        };
-
-
-struct sessionIdIpV4UserHashTableContent {
-        uint32_t ipUser;
-        uint32_t userTeid;
-        uint64_t sessionId;
-        uint8_t  outputInterface;
-        };
-
-struct sessionIdIpV6UserHashTableContent {
-        uint8_t  ipUserV6[IPV6_ADDR_LEN];
-        uint32_t userTeid;
-        uint64_t sessionId;
-        uint8_t  outputInterface;
-        };
-
-union ipv4_3tuple_host {
-	struct {
-		uint8_t		pad0;
-		uint8_t		pad1;//proto
-		uint16_t	pad2;
-		uint32_t	ip_src;
-		uint32_t	ip_dst;
-		uint16_t	pad3;
-		uint16_t	pad4;//dst port
-		uint16_t	pad5;//dgram len
-       	        uint16_t	pad6;//cksum
-		uint32_t	flagsMsgTypeAndLen; 
-               	uint32_t	teid;
-		uint32_t	pad7;
-		};
-
-	__m128i xmm[2];
-	};
-
-union ipv6_3tuple_host {
-        struct {
-                uint16_t	pad0;
-                uint8_t		pad1;//proto
-                uint8_t		pad2;
-                uint32_t	ip_src[IPV6_ADDR_LEN];
-                uint32_t	ip_dst[IPV6_ADDR_LEN];
-                uint16_t	pad3;
-                uint16_t	pad4;//dst port
-                uint16_t	pad5;//dgram len
-                uint16_t	pad6;//cksum
-                uint32_t	flagsMsgTypeAndLen;
-                uint32_t	teid;
-		uint32_t	pad9;
-		uint32_t	pad10;
-		uint32_t	pad11;
-                };
-
-        __m128i xmm[4];
-        };
-
-struct gtpStatistics
-		{
-		uint32_t	lcoreid;
-		uint64_t	gtpV1IpV4CtrlPkt;
-		uint64_t	gtpV1IpV6CtrlPkt;
-		uint64_t	gtpV1IpV4UserPkt;
-		uint64_t	gtpV1IpV6UserPkt;
-		uint64_t	gtpV2IpV4CtrlPkt;
-		uint64_t	gtpV2IpV6CtrlPkt;
-		uint64_t	gtpV2IpV4UserPkt;
-		uint64_t	gtpV2IpV6UserPkt;
-		uint64_t	gtpV1CtrlPktDiscards;
-		uint64_t	gtpV1UserPktDiscards;
-		uint64_t	gtpV2CtrlPktDiscards;
-		uint64_t	gtpV2UserPktDiscards;
-		};
-
-struct gtpStatistics gtpStats;
-
-
-static __m128i ipV4HashMask0;
-static __m128i ipV4HashMask1;
-static __m128i ipV4HashMask2;
-static __m128i ipV4HashMask3;
-
-static __m128i ipV6HashMask0;
-static __m128i ipV6HashMask1;
-static __m128i ipV6HashMask2;
-
-struct rte_hash * pSessionIdV4ControlHashTable;
-struct rte_hash * pSessionIdV4GtpV2ControlHashTable;
-struct rte_hash * pSessionIdV6GtpV2ControlHashTable;
-struct rte_hash * pSessionIdV6ControlHashTable;
-struct rte_hash * pSessionIdV4UserHashTable;
-struct rte_hash * pSessionIdV6UserHashTable;
-
-struct sessionIdIpV4HashObject *pIpV4ControlHashObjectArray[RTE_MAX_LCORE][MAX_HASH_OBJECT_PER_REQUEST];
-//struct sessionIdIpV4GtpV2HashObject *pIpV4GtpV2ControlHashObjectArray[RTE_MAX_LCORE][MAX_HASH_OBJECT_PER_REQUEST];
-struct sessionIdIpV6HashObject *pIpV6ControlHashObjectArray[RTE_MAX_LCORE][MAX_HASH_OBJECT_PER_REQUEST];
-//struct sessionIdIpV6GtpV2HashObject *pIpV6GtpV2ControlHashObjectArray[RTE_MAX_LCORE][MAX_HASH_OBJECT_PER_REQUEST];
-
-#define XMM_NUM_IN_IPV6_3TUPLE  4
-#define SESSION_HASH_ENTRIES    1024*1024
-
-static struct sessionIdIpV4HashTableContent sessionIdControlHashTableIPV4[SESSION_HASH_ENTRIES] __rte_cache_aligned;
-static struct sessionIdIpV4GtpV2HashTableContent sessionIdControlHashTableIPV4GTPV2[SESSION_HASH_ENTRIES] __rte_cache_aligned;
-static struct sessionIdIpV6HashTableContent sessionIdControlHashTableIPV6[SESSION_HASH_ENTRIES] __rte_cache_aligned;
-static struct sessionIdIpV6GtpV2HashTableContent sessionIdControlHashTableIPV6GTPV2[SESSION_HASH_ENTRIES] __rte_cache_aligned;
-static struct sessionIdIpV4UserHashTableContent sessionIdUserHashTableIPV4[SESSION_HASH_ENTRIES] __rte_cache_aligned;
-static struct sessionIdIpV6UserHashTableContent sessionIdUserHashTableIPV6[SESSION_HASH_ENTRIES] __rte_cache_aligned;
-
-//static struct sessionIdHashObject sessionIdHashTableIPV6[SESSION_HASH_ENTRIES] __rte_cache_aligned;
-
-//Global sessionid per box, if multiple boxes, this id needs to have meaning spread across boxes.  is a TODO
-static uint32_t globalSessionId;
-static uint16_t	lastInterfaceUsed;  //keep track of tx interface for load balancing across tx
-
-//Define minimal set of GTP message types for the load balancer to work
-
-#define GTP_PDP_CONTEXT_REQUEST		0x00100000
-#define GTP_PDP_CONTEXT_RESPONSE	0x00110000
-#define GTP_PDP_UPDATE_REQUEST		0x00120000
-#define GTP_PDP_UPDATE_RESPONSE		0x00130000
-#define GTP_PDP_DELETE_CONTEXT_REQUEST	0x00140000
-#define GTP_PDP_DELETE_CONTEXT_RESPONSE	0x00150000
-#define GTP_NPDU_PRESENT		0X01000000
-#define GTP_SEQ_NUMBER_PRESENT		0x02000000
-#define GTP_EXT_HEADER_PRESENT		0x04000000
-#define GTP_VERSION1_IN_FLAGS		0x20000000
-#define GTP_VERSION2_IN_FLAGS		0x40000000
-		
-//GTP types
-#define GTPV1_TYPE_CAUSE		0x01
-#define GTPV1_TYPE_IMSI			0x02
-#define GTPV1_TYPE_RAI			0x03
-#define GTPV1_TYPE_REORDERING_REQD	0x08
-#define GTPV1_TYPE_RECOVERY		0x0e
-#define GTPV1_TYPE_SEL_MODE		0x0f
-#define GTPV1_TYPE_DATA_TEID		0x10
-#define GTPV1_TYPE_CTRL_TEID		0x11
-#define GTPV1_TYPE_TEARDOWN		0x13
-#define GTPV1_TYPE_NSAPI		0x14
-#define GTPV1_TYPE_CHARGING_CHK		0x1A
-#define GTPV1_TYPE_TRACE_REF		0x1B
-#define GTPV1_TYPE_TRACE_TYPE		0x1C
-#define GTPV1_TYPE_END_USER_ADD		0x80
-#define GTPV1_TYPE_ACCESS_PT_NAME	0x83
-#define GTPV1_TYPE_PROTOCOL_CFG_OPT	0x84
-#define GTPV1_TYPE_SGSN_ADDR		0x85
-#define GTPV1_TYPE_CHARGING_ID		0x7F
-
-//ip pkt type
-#define	PACKET_TYPE_IPV4		0x00
-#define	PACKET_TYPE_IPV6		0x01
-
-//vlan tag	
-#define PACKET_VLAN_TAG_PRESENT		0X00
-#define PACKET_NO_VLAN_TAG_PRESENT	0X01
-
-#define GTPV2_CREATE_SESSION_REQUEST	0x00200000
-#define GTPV2_CREATE_BEARER_REQUEST	0x005f0000
-#define GTPV2_MODIFY_BEARER_REQUEST	0x00220000
-#define GTPV2_CREATE_SESSION_RESPONSE	0x00210000
-#define GTPV2_CREATE_BEARER_RESPONSE	0x00600000
-#define GTPV2_MODIFY_BEARER_RESPONSE	0x00230000
-#define GTPV2_TEID_PRESENT		0x08000000
-#define GTPV2_TYPE_FTEID		0x57
-#define GTPV2_TYPE_BEARER_CONTEXT	0x5d
 
 #if 0
 static inline uint8_t
@@ -611,30 +180,45 @@ print_stats(void)
 
         printf("\nGTP statistics ==============================="
                    "\nTotal ipv4 gtpv1 control pkts received : %18"PRIu64
-                   "\nTotal ipv4 gtpv1 user pkts received : %18"PRIu64
+                   "\nTotal ipv4 gtpv1 and gtpv2 user pkts received : %11"PRIu64
+                   "\nTotal ipv4 gtpv1 and gtpv2 user pkt fragments received : %11"PRIu64
+                   "\nTotal ipv6 gtpv1 and gtpv2 user pkt fragments received : %11"PRIu64
                    "\nTotal ipv4 gtpv2 control pkts received : %18"PRIu64
-                   "\nTotal ipv4 gtpv2 user pkts received: %14"PRIu64
                    "\nTotal ipv6 gtpv1 control pkts received : %18"PRIu64
-                   "\nTotal ipv6 gtpv1 user pkts received : %18"PRIu64
+                   "\nTotal ipv6 gtpv1 and gtpv2 user pkts received : %11"PRIu64
                    "\nTotal ipv6 gtpv2 control pkts received : %18"PRIu64
-                   "\nTotal ipv6 gtpv2 user pkts received: %14"PRIu64,
+                   "\nTotal ipv6 gtpv1 and gtpv2 user pkts discards: %12"PRIu64
+                   "\nTotal ipv4 gtpv1 and gtpv2 user pkts fragment discards: %12"PRIu64
+                   "\nTotal ipv6 gtpv1 and gtpv2 user pkts fragment discards: %12"PRIu64
+                   "\nTotal ipv4 gtpv1 and gtpv2 user pkts discards: %12"PRIu64
+                   "\nTotal ipv6 gtpv1 ctrl pkts discards: %22"PRIu64
+                   "\nTotal ipv6 gtpv2 ctrl pkts discards: %22"PRIu64
+                   "\nTotal ipv4 gtpv1 ctrl pkts discards: %22"PRIu64
+                   "\nTotal ipv4 gtpv2 ctrl pkts discards: %22"PRIu64,
                    gtpStats.gtpV1IpV4CtrlPkt,
-                   gtpStats.gtpV1IpV4UserPkt,
+                   gtpStats.gtpV1V2IpV4UserPkt,
+                   gtpStats.gtpV1V2IpV4UserPktFragment,
+                   gtpStats.gtpV1V2IpV6UserPktFragment,
                    gtpStats.gtpV2IpV4CtrlPkt,
-                   gtpStats.gtpV2IpV4UserPkt,
                    gtpStats.gtpV1IpV6CtrlPkt,
-                   gtpStats.gtpV1IpV6UserPkt,
+                   gtpStats.gtpV1V2IpV6UserPkt,
                    gtpStats.gtpV2IpV6CtrlPkt,
-                   gtpStats.gtpV2IpV6UserPkt
+ 		   gtpStats.gtpV1V2IpV6UserPktDiscards,
+ 		   gtpStats.gtpV1V2IpV4UserPktFragmentDiscards,
+ 		   gtpStats.gtpV1V2IpV6UserPktFragmentDiscards,
+ 		   gtpStats.gtpV1V2IpV4UserPktDiscards,
+ 		   gtpStats.gtpV1IpV6ControlPktDiscards,
+ 		   gtpStats.gtpV2IpV6ControlPktDiscards,
+                   gtpStats.gtpV1IpV4ControlPktDiscards,
+                   gtpStats.gtpV2IpV4ControlPktDiscards
                    );
         printf("\n====================================================\n");
 
 	
 }
-#if 0
 /* Send the burst of packets on an output interface */
 static int
-l2fwd_send_burst(struct lcore_queue_conf *qconf, unsigned n, uint8_t port)
+lte_send_burst(struct lcore_queue_conf *qconf, unsigned n, uint8_t port)
 {
 	struct rte_mbuf **m_table;
 	unsigned ret;
@@ -644,6 +228,7 @@ l2fwd_send_burst(struct lcore_queue_conf *qconf, unsigned n, uint8_t port)
 
 	ret = rte_eth_tx_burst(port, (uint16_t) queueid, m_table, (uint16_t) n);
 	port_statistics[port].tx += ret;
+	printf ("tx burst ret=%d, n=%d\n",ret,n);
 	if (unlikely(ret < n)) {
 		port_statistics[port].dropped += (n - ret);
 		do {
@@ -656,28 +241,76 @@ l2fwd_send_burst(struct lcore_queue_conf *qconf, unsigned n, uint8_t port)
 
 /* Enqueue packets for TX and prepare them to be sent */
 static int
-l2fwd_send_packet(struct rte_mbuf *m, uint8_t port)
+lte_send_packet(struct rte_mbuf *m, uint8_t port)
 {
 	unsigned lcore_id, len;
 	struct lcore_queue_conf *qconf;
-
+	char name[32];
+	int ret, socketid;
+	struct rte_ring *pTransmitRing;
+	int timepass = 0;
+	int detectedProtocol;
+  	const u_char *packet;
+  	struct ndpi_ethhdr *ethernet;
+  	struct ndpi_iphdr *iph;
+	struct LteInfoAppend	*pLteAppend;
 	lcore_id = rte_lcore_id();
+	u_int16_t  type=0x0, ip_offset=0x0;
+        printf ("sks:lte_send_packet rte_mbuf m (0x%x)\n", m);
+
+	populateIDRTable (m,0);
+	//detectedProtocol = dpiModule ( m );
+        //idrCreate ( m );
+	//...extract sessionid of packet.
+	
+        
+	/*//comment out for now, no tx, since dpi is on the same box	
+	port = 0x0;
 
 	qconf = &lcore_queue_conf[lcore_id];
 	len = qconf->tx_mbufs[port].len;
 	qconf->tx_mbufs[port].m_table[len] = m;
 	len++;
 
-	/* enough pkts to be sent */
+	printf ("sks: tx pkt on port-=0x%x MAX=%d len=%d...\n",port, MAX_PKT_BURST,len);
+	//enough pkts to be sent 
 	if (unlikely(len == MAX_PKT_BURST)) {
-		l2fwd_send_burst(qconf, MAX_PKT_BURST, port);
+		lte_send_burst(qconf, MAX_PKT_BURST, port);
 		len = 0;
 	}
 
+	lte_send_burst (qconf, len,port);
+
 	qconf->tx_mbufs[port].len = len;
-	return 0;
+        
+	socketid = rte_lcore_to_socket_id(rte_lcore_id( ) );
+        rte_snprintf(name, sizeof(name), "Transmit_ring%u_io%u_sId4",
+                    socketid,
+                    lcore_id);
+
+        pTransmitRing = rte_ring_lookup (name);
+        if (pTransmitRing == NULL )
+        	{
+                printf ("Cannot find ring %s\n", name);
+                return Aok;
+                }
+	printf ("sks: enqueuing on ring %s\n", name);
+        ret = rte_ring_mp_enqueue (pTransmitRing, (void *) m);
+
+        if (ret != 0 )
+                {
+                printf ("error in enqueuing to TransmitRing\n");
+                return Aok;
+		}
+	
+	while ( rte_ring_count (pTransmitRing)  != 0 ) {};
+	while ( timepass++ < 10000);//...give dpi lcore time to clone the mbuf*/
+
+
+
+	return Aok;
 }
-#endif
+
 
 //...Calculate the timestamp
 
@@ -692,6 +325,61 @@ calculateTimeStamp(struct timeval *ts) {
         timeradd(&start_time, &cur_time, ts);
 }
 
+static void createIdrControlAndUserRings ( void )
+        {
+        char name[32];
+        unsigned socket_io;
+        uint32_t lcore = rte_lcore_id ();
+
+        socket_io = rte_lcore_to_socket_id(lcore);
+
+
+        printf("Creating ring to process control IDRs lcore=%u socket=%u...\n",
+                lcore,
+                socket_io);
+
+        rte_snprintf(name, sizeof(name), "idrControlRing%u_io%u_sId4",
+                                socket_io,
+                                lcore);
+
+        pIdrControlRing = rte_ring_create(
+                               name,
+                               2048,    //...2k ring size
+                               socket_io,
+                               RING_F_SC_DEQ);
+
+        if (pIdrControlRing == NULL) {
+                           rte_panic("Cannot create idr control ring to \n"
+                                    );
+
+                           }
+
+        printf ("sks: successfully created idrControlRing %s\n", pIdrControlRing->name);
+
+        printf("Creating ring to process user IDRs lcore=%u socket=%u...\n",
+                lcore,
+                socket_io);
+
+        rte_snprintf(name, sizeof(name), "idrUserRing%u_io%u_sId4",
+                                socket_io,
+                                lcore);
+
+        pIdrUserRing = rte_ring_create(
+                               name,
+                               2048,    //...2k ring size
+                               socket_io,
+                               RING_F_SC_DEQ);
+
+        if (pIdrUserRing == NULL) {
+                           rte_panic("Cannot create idr user ring to \n"
+                                    );
+
+                           }
+
+        printf ("sks: successfully created idrUserRing %s\n", pIdrUserRing->name);
+
+
+        }
 
 
 
@@ -709,10 +397,13 @@ static inline void createUserAndControlRings ( void )
         ipV4HashMask1 = _mm_set_epi32(0,0,ALL_32_BITS, 0 );
         ipV4HashMask3 = _mm_set_epi32(0,0,0,0);
         ipV4HashMask2 = _mm_set_epi32(0,ALL_32_BITS,0,0);
+        ipV4HashMask4 = _mm_set_epi32(ALL_32_BITS,ALL_32_BITS,0,0);
+        ipV4HashMask5 = _mm_set_epi32(ALL_32_BITS,ALL_32_BITS,ALL_32_BITS,ALL_32_BITS);
 
         ipV6HashMask0 = _mm_set_epi32( ALL_32_BITS, ALL_32_BITS, ALL_32_BITS,0);
         ipV6HashMask1 = _mm_set_epi32( ALL_32_BITS, 0,0,ALL_32_BITS);
         ipV6HashMask2 = _mm_set_epi32( 0, 0, 0,ALL_32_BITS);
+        ipV6HashMask3 = _mm_set_epi32( ALL_32_BITS,ALL_32_BITS,ALL_32_BITS,ALL_32_BITS);
 
         printf("Creating ring to connect I/O lcore %u (socket %u) with user lcore 2 and control lcore 3 ...\n",
                 lcore,
@@ -745,7 +436,7 @@ static inline void createUserAndControlRings ( void )
                                name,
                                2048,    //...2k ring size
                                socket_io,
-                               RING_F_SP_ENQ | RING_F_SC_DEQ);
+                               RING_F_SC_DEQ);
 
         if (pSessionIdV6ControlRing == NULL) {
                            rte_panic("Cannot create ring to connect I/O core %u with user core 2\n",
@@ -772,10 +463,29 @@ static inline void createUserAndControlRings ( void )
                                     lcore);
 
                            }
-
         printf ("sks: successfully created transmitRing %s\n", pTransmitRing->name);
 
+        rte_snprintf(name, sizeof(name), "FragId_ring%u_io%u_sId4",
+                                socket_io,
+                                lcore);
+
+        pFragRing = rte_ring_create(
+                               name,
+                               2048,    //...2k ring size
+                               socket_io,
+                               RING_F_SC_DEQ);
+
+        if (pFragRing == NULL) {
+                           rte_panic("Cannot create ring to connect I/O core %u with user core 2\n",
+                                    lcore);
+
+                           }
+
+        printf ("sks: successfully created fragRing %s\n", pFragRing->name);
+
+	createIdrControlAndUserRings ( );
 	}
+
 
 static void pktRetryTimerCb (__attribute__((unused)) struct rte_timer *tim,
                             __attribute__((unused)) void *pkt);
@@ -800,6 +510,8 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
         union		ipv6_3tuple_host newKeyV6;
         union		ipv6_3tuple_host keyV6;
         union		ipv6_3tuple_host dupKeyV6;
+        union		ipv6_2tuple_host fragKeyV6;
+        union		ipv4_2tuple_host fragKeyV4;
         struct		sessionIdIpV4HashTableContent *pSessionIdObj;
         struct		sessionIdIpV4GtpV2HashTableContent *pSessionIdObjGtpV2;
         struct		sessionIdIpV6HashTableContent *pSessionIdObjV6 = NULL;
@@ -820,6 +532,7 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
         char		name[32];
         int		gtpType;
         struct		rte_ring * pControlRing;
+        struct		rte_ring * pFragIdRing;
 	uint32_t	sGsnIpV4UserAddr = 0; 
 	uint32_t	sGsnIpV6UserAddr[IPV6_ADDR_LEN]={0,0,0,0}; 
 	uint32_t	sGsnIpV4ControlAddr = 0; 
@@ -828,9 +541,16 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
 	uint8_t *	pGtpParser=NULL;
 	uint8_t		tearDownFlag = 0;
 	uint8_t		ipPktType;
+	uint8_t		etherPktType = 0x0;
 	uint8_t		vlanTag;
-	uint64_t	sessionIdOfUpdateRequest=0;
+	uint32_t	sessionIdOfUpdateRequest, createReqSessionId=0;
 	void *		pGtpV2Header;
+	int		ipType;
+	int		fragPresent = 0;
+	uint32_t	fragId = 0;
+	struct		ipV6FragmentHeader *pFragHeader;
+
+	bzero (&lteAppendage, sizeof(struct LteInfoAppend));
 
 	char * pLteAppendage = rte_pktmbuf_append (m,sizeof(struct LteInfoAppend));
 
@@ -847,38 +567,138 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                         {
 			ipPktType = PACKET_TYPE_IPV4;
                         ipv4_hdr = (struct ipv4_hdr *)(rte_pktmbuf_mtod(m, unsigned char *) + sizeof(struct ether_hdr) + sizeof (struct vlan_hdr));
+			//...first 3 bits of the offset are flags, so mask it off
+			if ((rte_cpu_to_be_16(ipv4_hdr->fragment_offset)& 0x1FFF) !=0)
+				{
+				printf ("sks: ipv4 vlan frag=true\n");
+				fragPresent = 1;
+				fragId = (uint32_t)(rte_cpu_to_be_32(ipv4_hdr->packet_id));
+				} 
 			}
                 if ( rte_cpu_to_be_16(pVlanHdr->eth_proto) == ETHER_TYPE_IPv6)
                         {
 			ipPktType = PACKET_TYPE_IPV6;
                         ipv6_hdr = (struct ipv6_hdr *)(rte_pktmbuf_mtod(m, unsigned char *) + sizeof(struct ether_hdr) + sizeof (struct vlan_hdr));
+			if (ipv6_hdr->proto == IPPROTO_FRAGMENT )
+				{
+				fragPresent = 1;
+				pFragHeader = (struct ipV6FragmentHeader *)(rte_pktmbuf_mtod(m, unsigned char *) + sizeof(struct ether_hdr) + sizeof (struct vlan_hdr) + sizeof (struct ipv6_hdr));
+				printf ("sks: ipv6 vlan frag=true\n");
+				fragId	= rte_cpu_to_be_32(pFragHeader->fragmentId);
+				}
                         }
 		}
 	else
 		{
 		//	...No VLAN tag to worry about.
 		vlanTag = PACKET_NO_VLAN_TAG_PRESENT;
+                if ( rte_cpu_to_be_16(eth_hdr->ether_type) == 0x0 )
+                        {
+                        //...cooked up linux frame, assume ipv4 and put appropriate ipv4_hdr pointer.
+                        //printf ("sks: cooked pkt\n");
+                        ipPktType = PACKET_TYPE_IPV4;
+                        etherPktType = ETHER_PACKET_LINUX_COOKED;
+                        ipv4_hdr = (struct ipv4_hdr *)(rte_pktmbuf_mtod(m, unsigned char *) + sizeof(struct ether_hdr) + sizeof( uint16_t) );
+                        }
+
                 if  ( rte_cpu_to_be_16(eth_hdr->ether_type) == ETHER_TYPE_IPv4)
                         {
 			ipPktType = PACKET_TYPE_IPV4;
                         ipv4_hdr = (struct ipv4_hdr *)(rte_pktmbuf_mtod(m, unsigned char *) + sizeof(struct ether_hdr) );
+			//...first 3 bits of the offset are flags, so mask it off
+			if ((rte_cpu_to_be_16(ipv4_hdr->fragment_offset)& 0x1FFF) !=0)
+                                {
+                                fragPresent = 1;
+				fragId = (uint32_t)rte_cpu_to_be_32(ipv4_hdr->packet_id);
+				printf ("sks: ipv4 frag=true\n");
+                                }
 			}
                 if  ( rte_cpu_to_be_16(eth_hdr->ether_type) == ETHER_TYPE_IPv6)
                         {
 			ipPktType = PACKET_TYPE_IPV6;
                         ipv6_hdr = (struct ipv6_hdr *)(rte_pktmbuf_mtod(m, unsigned char *) + sizeof(struct ether_hdr) );
+                        if (ipv6_hdr->proto == IPPROTO_FRAGMENT )
+                                {
+                                fragPresent = 1;
+                                pFragHeader = (struct ipV6FragmentHeader *)(rte_pktmbuf_mtod(m, unsigned char *) + sizeof(struct ether_hdr) + sizeof (struct ipv6_hdr));
+				fragId	= rte_cpu_to_be_32(pFragHeader->fragmentId);
+				printf ("sks: ipv6 frag=true\n");
+                                }
 			}
 		}
 
-		
 	if (ipPktType == PACKET_TYPE_IPV6)
 		{		
                 pUdpHeader = (struct udp_hdr *)((unsigned char *)ipv6_hdr + sizeof(struct ipv6_hdr));
+
+		if (fragPresent == 1) 
+			{
+			pUdpHeader = (struct udp_hdr *)((unsigned char *)pUdpHeader + sizeof(struct ipV6FragmentHeader));
+			}
+
                 udpPortSrc = (uint16_t)(rte_cpu_to_be_16(pUdpHeader->src_port));
                 udpPortDst = (uint16_t)(rte_cpu_to_be_16(pUdpHeader->dst_port));
                 calculateTimeStamp (&currentTime);
+		lteAppendage.magic		   = 0xBACCFEED;
                 lteAppendage.secondTimeStamp       = currentTime.tv_sec;
                 lteAppendage.microSecondTimeStamp  = currentTime.tv_usec;
+
+		printf ("SKS: ipv6 fragPresent = 0x%x udpPortSrc=0x%x, udpPortDst=0x%x\n", fragPresent, udpPortSrc, udpPortDst);
+
+                if (fragPresent == 1)
+                	{
+                        bzero (&fragKeyV6, sizeof (fragKeyV6));
+                        fragKeyV6.ip_addr[0]=(uint32_t)(rte_cpu_to_be_32(ipv6_hdr->dst_addr[0]));
+                        fragKeyV6.ip_addr[1]=(uint32_t)(rte_cpu_to_be_32(ipv6_hdr->dst_addr[4]));
+                        fragKeyV6.ip_addr[2]=(uint32_t)(rte_cpu_to_be_32(ipv6_hdr->dst_addr[8]));
+                        fragKeyV6.ip_addr[3]=(uint32_t)(rte_cpu_to_be_32(ipv6_hdr->dst_addr[12]));
+                        fragKeyV6.fragId = fragId;
+
+                        ret = rte_hash_lookup (pIpV6FragIdHashTable, (const void *)&fragKeyV6);
+                        if ( ret >  0 )
+                        	{
+                                printf ("SKS: found matching frag\n");
+                                //      ... found, get sessionid and transmit out and exit
+                                lteAppendage.gtpSessionId = ipV6fragIdHashTable[ret].sessionId;
+                                rte_memcpy(pLteAppendage, &lteAppendage,sizeof(struct LteInfoAppend) );
+                                //TODO - All done, transmit it out right here if possible, since i/f number is avail (pSessionIdObj->intf)
+				//Assuming that on gtp user pkts have fragments not control pkts, hence incrementing only the user pkt stats.
+                                gtpStats.gtpV1V2IpV6UserPktFragment++;
+				lte_send_packet (m, 2); //hardcode port2 for now
+                                //...return here itself since this is not a fully formed gtp pkt, hence
+                                //...will not be in the user hash tbl.
+                                return Aok;
+                                }
+                        else
+                                {
+                                //...fragment might have arrived before the first fragment
+                                //...kick off timer and wait
+
+                                if (repeatCount == 0 )
+                                	{
+                			if ((udpPortSrc != USERPLANE_GTP_PORT)&&(udpPortDst != USERPLANE_GTP_PORT))
+						{
+	                                         printf ("sks:init timer case 2...\n");
+       		                                 struct rte_timer * pUserPlaneTimer;
+               		                         pUserPlaneTimer = (struct rte_timer *) rte_malloc ("userplane timer",sizeof (struct rte_timer),0);
+                       		                 int resetReturn = 0;
+                               		         rte_timer_init (pUserPlaneTimer);
+                                       		 //printf ("sks: timer reset...\n");
+                                        	 lcore_id = rte_lcore_id ();
+                                        	 resetReturn = rte_timer_reset (pUserPlaneTimer,RETRY_TIMEOUT,SINGLE,lcore_id,pktRetryTimerCb,(void *)m);
+                                        	 //printf ("sks: returning nok resetReturn=%d...\n", resetReturn);
+                                        	 return Nok;
+						}
+                                        }
+                               if (repeatCount == 1)
+                                        {
+                                        //...orphan pkt, update stats and discard.
+                                        gtpStats.gtpV1V2IpV6UserPktFragmentDiscards++;
+                                        return Aok;
+                                        }
+                               }
+                       }
+
 
                 if ((udpPortSrc == USERPLANE_GTP_PORT)||(udpPortDst == USERPLANE_GTP_PORT))
                         {
@@ -908,46 +728,115 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                         newKeyV6.ip_dst[2] = rte_cpu_to_be_32(keyV6.ip_dst[2]);
                         newKeyV6.ip_dst[3] = rte_cpu_to_be_32(keyV6.ip_dst[3]);
                         newKeyV6.teid	   = rte_cpu_to_be_32(keyV6.teid);
+			
+			ret = 0;
 
                         if (pSessionIdV6UserHashTable)
                                 {
-                                //printf ("sks UP lkup key: pad0=0x%x,pad1=0x%x,pad2=0x%x,ip_src=0x%x,ip_dst=0x%x,pad3=0x%x,pad4=0x%x,pad5=0x%x,pad6=0x%x,flags=0x%x,teid=0x%x,pad7=0x%x\n",
-                               //newKey.pad0,newKey.pad1,newKey.pad2,newKey.ip_src,newKey.ip_dst,newKey.pad3,newKey.pad4,newKey.pad5,newKey.pad6,newKey.flagsMsgTypeAndLen,newKey.teid,newKey.pad7);
+				printf ("sks:looking up v6 user hash table\n");
                                 ret = rte_hash_lookup(pSessionIdV6UserHashTable, (const void *)&newKeyV6);
                                 }
+			else
+				{
+				printf ("sks: USER HASHTABLE NOT INITIALIZED\n");
+				return Aok;
+				}
                         if (ret > 0)
                                 {
-                                pSessionIdUserObjV6 = &sessionIdUserHashTableIPV6[ret];
+				if (fragPresent == 1 )
+					{
+                                        lcore_id = rte_lcore_id();
+                                        socketid = rte_lcore_to_socket_id(rte_lcore_id( ) );
+                                        rte_snprintf(name, sizeof(name), "FragId_ring%u_io%u_sId4",
+                                                             socketid,
+                                                             lcore_id);
+
+                                        pFragIdRing = rte_ring_lookup (name);
+                                        if (pFragIdRing == NULL )
+                                        	{
+                                                printf ("Cannot find ring %s\n", name);
+                                                return Aok;
+                                                }
+                                        if (rte_ring_empty (pFragIdRing))
+                                        	{
+                                                printf ("setting all ring entries to NULL\n");
+                                                for (i=0;i<MAX_HASH_OBJECT_PER_REQUEST;i++)
+                                                	{
+                                                        //...Can optimize more here TODO
+                                                        if(pFragIdHashObjectArray[lcore_id][i])
+                                                        	{
+                                                                rte_free (pFragIdHashObjectArray[lcore_id][i]);
+                                                                pFragIdHashObjectArray[lcore_id][i] = NULL;
+                                                                }
+                                                        }
+                                                }
+
+                                        while (pFragIdHashObjectArray[lcore_id][objCount] != NULL )
+                                                objCount++;
+
+                                        if (objCount > MAX_HASH_OBJECT_PER_REQUEST )
+                                                {
+                                                printf ("FATAL: dropping pdp request msg\n");
+                                                return Aok;
+                                                }
+
+                                        pFragIdHashObjectArray[lcore_id][objCount] = (struct fragIdHashObject *) rte_malloc ("hash object  v6 array",sizeof(struct sessionIdIpV6HashObject),0);
+
+                                        pFragIdHashObjectArray[lcore_id][objCount]->ipV6DstAddr[0]           = newKeyV6.ip_dst[0];
+                                        pFragIdHashObjectArray[lcore_id][objCount]->ipV6DstAddr[1]           = newKeyV6.ip_dst[1];
+                                        pFragIdHashObjectArray[lcore_id][objCount]->ipV6DstAddr[2]           = newKeyV6.ip_dst[2];
+                                        pFragIdHashObjectArray[lcore_id][objCount]->ipV6DstAddr[3]           = newKeyV6.ip_dst[3];
+                                        pFragIdHashObjectArray[lcore_id][objCount]->ipV4DstAddr	             = 0x0;
+                                        pFragIdHashObjectArray[lcore_id][objCount]->sessionId	             = sessionIdUserHashTableIPV6[ret].sessionId;
+                                        pFragIdHashObjectArray[lcore_id][objCount]->fragId	             = fragId;
+
+                                        ret = rte_ring_mp_enqueue (pFragIdRing, (void *) pFragIdHashObjectArray[lcore_id][objCount]);
+
+                                        if (ret != 0 )
+                                        	{
+                                                printf ("error in enqueuing to FragIdRing\n");
+                                                return Aok;
+                                                }
+                                        gtpStats.gtpV1V2IpV6UserPktFragment++;
+					}
+		
+		                pSessionIdUserObjV6 = &sessionIdUserHashTableIPV6[ret];
                                 lteAppendage.gtpSessionId = pSessionIdUserObjV6->sessionId;
                                 //printf ("sks: user plane pkt, hash lkup sucessful, ready to send out pkt...\n");
                                 rte_memcpy(pLteAppendage, &lteAppendage,sizeof(struct LteInfoAppend) );
                                 //TODO - All done, transmit it out right here if possible, since i/f number is avail (pSessionIdObj->intf)
-                                gtpStats.gtpV1IpV6UserPkt++;
+                                gtpStats.gtpV1V2IpV6UserPkt++;
+				lte_send_packet (m, 2);
+				return Aok;
                                 }
                         if (ret < 0)
                                 {
+                                printf ("sks UP lkup key not found: pad0=0x%x,pad1=0x%x,pad2=0x%x,ip_src=0x%x,ip_dst=0x%x:0x%x:0x%x:0x%x,pad3=0x%x,pad4=0x%x,pad5=0x%x,pad6=0x%x,flags=0x%x,teid=0x%x\n",
+                               newKeyV6.pad0,newKeyV6.pad1,newKeyV6.pad2,newKeyV6.ip_src[0],newKeyV6.ip_dst[0],newKeyV6.ip_dst[1],newKeyV6.ip_dst[2],newKeyV6.ip_dst[3],newKeyV6.pad3,newKeyV6.pad4,newKeyV6.pad5,newKeyV6.pad6,newKeyV6.flagsMsgTypeAndLen,newKeyV6.teid);
+
                                 ////TODO - session not yet initiated but we have rx user data, kickoff timer and wait.
                                 printf ("sks: entry does not exist for user plane pkt, returning...repeatCount=%d\n",repeatCount);
 				if (repeatCount == 0 )
 					{
-                                        printf ("sks:init timer case 2...\n");
+                                        //printf ("sks:init timer case 2...\n");
                                         struct rte_timer * pUserPlaneTimer;
                                         pUserPlaneTimer = (struct rte_timer *) rte_malloc ("userplane timer",sizeof (struct rte_timer),0);
                                         int resetReturn = 0;
                                         rte_timer_init (pUserPlaneTimer);
-                                        printf ("sks: timer reset...\n");
+                                        //printf ("sks: timer reset...\n");
                                         lcore_id = rte_lcore_id ();
                                         resetReturn = rte_timer_reset (pUserPlaneTimer,RETRY_TIMEOUT,SINGLE,lcore_id,pktRetryTimerCb,(void *)m);
-                                        printf ("sks: returning nok resetReturn=%d...\n", resetReturn);
+                                        //printf ("sks: returning nok resetReturn=%d...\n", resetReturn);
                                         return Nok;
 					}
 				if (repeatCount == 1)
 					{
-					printf ("sks, timer ticked, still entry is not there, returning...\n");
-					//...orphan pkt, update stats and discard.
+                                        //...orphan pkt, update stats and discard.
+					gtpStats.gtpV1V2IpV6UserPktDiscards++;
 					return Aok;
 					}
                                 }
+			return Aok;
                         }
 
                  if ((udpPortSrc == CONTROLPLANE_GTP_PORT)||(udpPortDst == CONTROLPLANE_GTP_PORT))
@@ -997,7 +886,27 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                 ret = rte_hash_lookup(pSessionIdV6ControlHashTable, (const void *)&newKeyV6);
                                                 if (ret < 0 )
                                                         {
-                                                        printf ("orphan delete context request/response\n");
+                                        		if (repeatCount == 0 )
+                                                		{
+                                                		printf ("sks:init timer case 3...\n");
+                                                		struct rte_timer * pUserPlaneTimer;
+                                                		pUserPlaneTimer = (struct rte_timer *) rte_malloc ("userplane timer",sizeof (struct rte_timer),0);
+                                                		int resetReturn = 0;
+                                                		rte_timer_init (pUserPlaneTimer);
+                                                		printf ("sks: timer reset...\n");
+                                                		lcore_id = rte_lcore_id ();
+                                                		resetReturn = rte_timer_reset (pUserPlaneTimer,RETRY_TIMEOUT,SINGLE,lcore_id,pktRetryTimerCb,(void *)m);
+                                                		printf ("sks: returning nok resetReturn=%d...\n", resetReturn);
+                                                		return Nok;
+                                                		}
+                                        		if (repeatCount == 1)
+                                                		{
+                                                		//...orphan pkt, update stats and discard.
+                                                                gtpStats.gtpV1IpV6ControlPktDiscards++;
+								//...TODO: transmit anyway.
+								lte_send_packet (m, 2);
+                                                                return Aok;
+                                                                }
                                                         }
                                                 else
                                                         {
@@ -1013,7 +922,6 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                                 printf ("Cannot find ring %s\n", name);
                                                                 return Aok;
                                                                 }
-
                                                         if (rte_ring_empty (pControlRing))
                                                                 {
                                                                 printf ("setting all ring entries to NULL\n");
@@ -1063,6 +971,8 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                         printf ("sks: enqueueing delete msg objCount=%d\n", objCount);
 
                                                         ret = rte_ring_mp_enqueue (pControlRing, (void *)pIpV6ControlHashObjectArray[lcore_id][objCount]);
+
+							printf ("sks: ring %s, ring count=%u\n", pControlRing->name, rte_ring_count (pControlRing));
                                                         if (ret != 0 )
                                                                 {
                                                                 printf ("error in enqueuing to sessionIdRing\n");
@@ -1074,6 +984,8 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                         printf ("sks: all done for delete request/resp msg\n");
                                                         //TODO -All done transmit it out right here if possible, since i/f number is avail (pSessionIdObj->intf)
                                                         gtpStats.gtpV1IpV6CtrlPkt++;
+							lte_send_packet (m, 2);
+							return Aok;
                                                         }
                                                 break;
                                                 case GTP_PDP_UPDATE_REQUEST://intentional fall-thru
@@ -1109,6 +1021,7 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                         if (repeatCount == 1)
                                                                 {
                                                                 //...orphan pkt, update stats and discard.
+                                                                gtpStats.gtpV1IpV6ControlPktDiscards++;
                                                                 return Aok;
 								}
                                                         }
@@ -1125,9 +1038,9 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                                 {
                                                                 printf ("Cannot find ring %s\n", name);
                                                                 //TODO:tx it out nevertheless
+                                                                lte_send_packet (m, 2);
                                                                 return Aok;
                                                                 }
-
                                                         if (rte_ring_empty (pControlRing))
                                                                 {
                                                                 printf ("setting all ring entries to NULL\n");
@@ -1148,6 +1061,7 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                                 {
                                                                 printf ("FATAL: dropping pdp request msg\n");
                                                                 //TODO: tx it out
+                                                                lte_send_packet (m, 2);
                                                                 return Aok;
                                                                 }
 
@@ -1185,6 +1099,7 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                         lteAppendage.gtpSessionId = sessionIdControlHashTableIPV6[ret].sessionId;
                                                         rte_memcpy(pLteAppendage, &lteAppendage,sizeof(struct LteInfoAppend) );
                                                         //TODO -All done transmit it out right here if possible, since i/f number is avail (pSessionIdObj->intf)
+                                                        lte_send_packet (m, 2);
                                                         gtpStats.gtpV1IpV6CtrlPkt++;
                                                         }
 
@@ -1192,13 +1107,15 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                 case GTP_PDP_CONTEXT_RESPONSE:
                                                 printf ("sks: got context create request/response msg\n");
                                                 //...Create a new hash entry
+                                                pGtpParser = (unsigned char * ) ( (unsigned char *)pGtpHeader  + sizeof(struct GtpV1Header));
                                                 if ( rte_cpu_to_be_32(keyV6.flagsMsgTypeAndLen) & GTP_SEQ_NUMBER_PRESENT )
-                                                //...advance pGtpHeader pointer towards the control and data teids
-                                                        pGtpParser = (unsigned char * ) ( (unsigned char *)pGtpHeader  + sizeof(struct GtpV1Header) + sizeof (uint16_t));
+                                                	//...advance pGtpHeader pointer towards the control and data teids
+                                                        pGtpParser = (unsigned char * ) ( (unsigned char *)pGtpParser  +  sizeof (uint16_t));
 
                                                 //printf ("sks:ctrl plane pkt - recognized pdp request 0x%x \n", (int)(*pGtpParser) );
+                                                //
                                                 if ( rte_cpu_to_be_32(keyV6.flagsMsgTypeAndLen) & GTP_NPDU_PRESENT )
-                                                        pGtpParser      = (unsigned char *) ((unsigned char *)pGtpHeader + sizeof (uint8_t));
+                                                        pGtpParser      = (unsigned char *) ((unsigned char *)pGtpParser + sizeof (uint8_t));
 
                                                 /*printf ("*****hex dump****\n");
                                                 while (octets < 32)
@@ -1317,11 +1234,50 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                 //Check for duplicate
                                                 union ipv6_3tuple_host dupKey;
                                                 bzero (&dupKey, sizeof(dupKey));
-                                                dupKey.ip_dst[0] = sGsnIpV6ControlAddr[0];
-                                                dupKey.ip_dst[1] = sGsnIpV6ControlAddr[1];
-                                                dupKey.ip_dst[2] = sGsnIpV6ControlAddr[2];
-                                                dupKey.ip_dst[3] = sGsnIpV6ControlAddr[3];
-                                                dupKey.teid   = controlTeid;
+                                                if ((rte_cpu_to_be_32(key.flagsMsgTypeAndLen) & 0x00FF0000 )== GTP_PDP_CONTEXT_RESPONSE)
+                                                        {
+                                                        //...Tie the pdp response and request together with the same sessioId
+                                                        dupKey.ip_dst[0] = rte_cpu_to_be_32(keyV6.ip_dst[0]);
+                                                        dupKey.ip_dst[1] = rte_cpu_to_be_32(keyV6.ip_dst[1]);
+                                                        dupKey.ip_dst[2] = rte_cpu_to_be_32(keyV6.ip_dst[2]);
+                                                        dupKey.ip_dst[3] = rte_cpu_to_be_32(keyV6.ip_dst[3]);
+                                                        dupKey.teid = rte_cpu_to_be_32(key.teid);
+                                                        ret = rte_hash_lookup(pSessionIdV6ControlHashTable, (const void *)&dupKey);
+                                                        if (ret > 0)
+                                                                {
+                                                                //...pdp create request entry found, get the sessionId
+                                                                createReqSessionId = sessionIdControlHashTableIPV6[ret].sessionId;
+                                                                }
+                                                        else
+                                                                {
+                                                                //...received create response earlier than create request, kick off timer and wait
+                                                                if (repeatCount == 0 )
+                                                                        {
+                                                                        printf ("sks:init timer case 6...\n");
+                                                                        struct rte_timer * pUserPlaneTimer;
+                                                                        pUserPlaneTimer = (struct rte_timer *) rte_malloc ("userplane timer",sizeof (struct rte_timer),0);
+                                                                        int resetReturn = 0;
+                                                                        rte_timer_init (pUserPlaneTimer);
+                                                                        printf ("sks: timer reset...\n");
+                                                                        lcore_id = rte_lcore_id ();
+                                                                        resetReturn = rte_timer_reset (pUserPlaneTimer,RETRY_TIMEOUT,SINGLE,lcore_id,pktRetryTimerCb,(void *)m);
+                                                                        printf ("sks: returning nok resetReturn=%d...\n", resetReturn);
+                                                                        return Nok;
+                                                                        }
+                                                                if (repeatCount == 1)
+                                                                        {
+                                                                        //orphan pkt, update stat and return
+                                                                        gtpStats.gtpV1CtrlPktDiscards++;
+                                                                        return Aok;
+                                                                        }
+                                                                }
+                                                        }
+
+                                                dupKey.ip_dst[0] = rte_cpu_to_be_32(sGsnIpV6ControlAddr[0]);
+                                                dupKey.ip_dst[1] = rte_cpu_to_be_32(sGsnIpV6ControlAddr[1]);
+                                                dupKey.ip_dst[2] = rte_cpu_to_be_32(sGsnIpV6ControlAddr[2]);
+                                                dupKey.ip_dst[3] = rte_cpu_to_be_32(sGsnIpV6ControlAddr[3]);
+                                                dupKey.teid   = rte_cpu_to_be_32(controlTeid);
                                                 ret = rte_hash_lookup(pSessionIdV6ControlHashTable, (const void *)&dupKey);
 
                                                 if (ret > 0)
@@ -1332,6 +1288,7 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                         printf ("detected duplicate pdp request, ready to send out pkt...\n");
                                                         rte_memcpy(pLteAppendage, &lteAppendage,sizeof(struct LteInfoAppend) );
                                                         //TODO - All done, transmit it out right here if possible, since i/f number is avail (pSessionIdObj->intf)
+                                                        lte_send_packet (m, 2);
                                                         gtpStats.gtpV1IpV6CtrlPkt++;
                                                         }
                                                 else
@@ -1399,8 +1356,17 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
 
                                                         pIpV6ControlHashObjectArray[lcore_id][objCount]->controlTeid    = controlTeid;
                                                         pIpV6ControlHashObjectArray[lcore_id][objCount]->dataTeid       = dataTeid;
-                                                        globalSessionId = ((globalSessionId & 0x0000ffffffffffff)|(((uint64_t)lcore_id) << 48));
-                                                        pIpV6ControlHashObjectArray[lcore_id][objCount]->sessionId      = globalSessionId;
+
+                                                        if (createReqSessionId != 0 )
+                                                                {
+                                                                pIpV6ControlHashObjectArray[lcore_id][objCount]->sessionId      = createReqSessionId;
+                                                                createReqSessionId = 0;
+                                                                }
+							else
+								{
+								printf ("sks: generating globalSessionId =0x%x\n", globalSessionId);
+                                                        	pIpV6ControlHashObjectArray[lcore_id][objCount]->sessionId      = globalSessionId++;
+								}
  							
 							if ((((rte_cpu_to_be_32(keyV6.flagsMsgTypeAndLen) & 0x00FF0000)== GTP_PDP_UPDATE_REQUEST))||((rte_cpu_to_be_32(keyV6.flagsMsgTypeAndLen) & 0x00FF0000)== GTP_PDP_UPDATE_RESPONSE))
                                                         {
@@ -1418,7 +1384,7 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                                 secKeyV6.ip_src[1] = sGsnIpV6ControlAddr[1];
                                                                 secKeyV6.ip_src[2] = sGsnIpV6ControlAddr[2];
                                                                 secKeyV6.ip_src[3] = sGsnIpV6ControlAddr[3];
-                                                                secKeyV6.teid	   = keyV6.teid;
+                                                                secKeyV6.teid	   = rte_cpu_to_be_32(keyV6.teid);
                                                                 ret = rte_hash_lookup(pSessionIdV6ControlHashTable, (const void *)&secKeyV6);
                                                                 if (ret > 0 )
                                                                         {
@@ -1427,14 +1393,16 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                                         pIpV6ControlHashObjectArray[lcore_id][objCount]->sessionId = pSessionIdObjV6->sessionId;
                                                                         }
                                                                 }
-
                                                         ret = rte_ring_mp_enqueue (pControlRing, (void *)pIpV6ControlHashObjectArray[lcore_id][objCount]);
                                                         if (ret != 0 )
                                                                 printf ("error in enqueuing to sessionIdRing\n");
-                                                        lteAppendage.gtpSessionId = globalSessionId++;
+                                                        lteAppendage.gtpSessionId = pIpV6ControlHashObjectArray[lcore_id][objCount]->sessionId;
+
                                                         rte_memcpy(pLteAppendage, &lteAppendage,sizeof(struct LteInfoAppend) );
                                                         //TODO -All done transmit it out right here if possible, since i/f number is avail (pSessionIdObj->intf)
                                                         gtpStats.gtpV1IpV6CtrlPkt++;
+							lte_send_packet (m, 2);
+							return Aok;
                                                         }
                                                 break;  //ctxt req/resp case
                                                 }
@@ -1442,10 +1410,109 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
 			          if (rte_cpu_to_be_32(keyV6.flagsMsgTypeAndLen) & GTP_VERSION2_IN_FLAGS)
                                         {
                                         //GTPv2 processing, but gtp header info is the same so reuse v1 hdr
-                                        printf ("sks:gtpv2, switch = 0x%x\n", (int)((rte_cpu_to_be_32(keyV6.flagsMsgTypeAndLen) & ALL_32_BITS )));
+                                        //printf ("sks:gtpv2, switch = 0x%x\n", (int)((rte_cpu_to_be_32(keyV6.flagsMsgTypeAndLen) & ALL_32_BITS )));
 
                                         switch ((rte_cpu_to_be_32(keyV6.flagsMsgTypeAndLen) & 0x00FF0000 ))
                                                 {
+						case GTPV2_TYPE_REL_ACC_BEARER_REQ   : //intentional fall-thru
+						case GTPV2_TYPE_REL_ACC_BEARER_RSP   :
+						case GTPV2_TYPE_DEL_SESSION_REQ      :
+						case GTPV2_TYPE_DEL_SESSION_RSP      :
+                                                bzero (&dupKeyV6, sizeof(dupKeyV6));
+                                                dupKeyV6.ip_dst[0] = rte_cpu_to_be_32(keyV6.ip_dst[0]);
+                                                dupKeyV6.ip_dst[1] = rte_cpu_to_be_32(keyV6.ip_dst[1]);
+                                                dupKeyV6.ip_dst[2] = rte_cpu_to_be_32(keyV6.ip_dst[2]);
+                                                dupKeyV6.ip_dst[3] = rte_cpu_to_be_32(keyV6.ip_dst[3]);
+
+						printf ("sks: delete request for gtpv2\n");
+                                                if (rte_cpu_to_be_32(keyV6.flagsMsgTypeAndLen) & GTPV2_TEID_PRESENT)
+                                                        {
+                                                        //printf ("sks: gtpv2 bearer TEID is present\n");
+                                                        pGtpV2Header = (struct GtpV2Header *)((unsigned char *)ipv6_hdr + sizeof(struct ipv6_hdr) + sizeof (struct udp_hdr) );
+                                                        pGtpParser = (unsigned char * ) ( (unsigned char *)pGtpV2Header  + sizeof(struct GtpV2Header) );
+                                                        dupKeyV6.teid = rte_cpu_to_be_32(((struct GtpV2Header *)pGtpV2Header)->teid);
+                                                        }
+                                                else
+                                                        {
+                                                        pGtpV2Header = (struct GtpV2Header_noTeid *)((unsigned char *)ipv6_hdr + sizeof(struct ipv6_hdr) + sizeof (struct udp_hdr) );
+                                                        pGtpParser = (unsigned char * ) ( (unsigned char *)pGtpV2Header  + sizeof(struct GtpV2Header_noTeid) );
+                                                        printf ("sks: need to increment a stat, exiting processing this pkt since no teid in hdr and is not a create mgs\n");
+							//TODO: tx it out
+							lte_send_packet (m, 2);
+                                                        return Aok;
+                                                        }
+                                                printf ("looking up control ip=0x%x:0x%x:0x%x:0x%x, teid = 0x%x\n", dupKeyV6.ip_dst[0], dupKeyV6.ip_dst[1], dupKeyV6.ip_dst[2], dupKeyV6.ip_dst[3],dupKeyV6.teid);
+                                                ret = rte_hash_lookup(pSessionIdV6GtpV2ControlHashTable,(const void *)&dupKeyV6);
+
+                                                if (ret <= 0 )
+                                                        {
+                                                printf ("error looking up control ip=0x%x:0x%x:0x%x:0x%x, teid = 0x%x\n", dupKeyV6.ip_dst[0], dupKeyV6.ip_dst[1], dupKeyV6.ip_dst[2], dupKeyV6.ip_dst[3],dupKeyV6.teid);
+                                                        }
+						if (ret > 0)
+							{
+                                                        //create  a new entry in hash table
+                                                        //cleanup hash object array first
+                                                        lcore_id = rte_lcore_id();
+                                                        socketid = rte_lcore_to_socket_id(rte_lcore_id( ) );
+                                                        rte_snprintf(name, sizeof(name), "sessionIdAddV6Control_ring%u_io%u_sId4",
+                                                                     socketid,
+                                                                     lcore_id);
+
+                                                        pControlRing = rte_ring_lookup (name);
+                                                        if (pControlRing == NULL )
+	                                                        {
+                                                                printf ("Cannot find ring %s\n", name);
+                                                                return Aok;
+                                                                }
+
+                                                        if (rte_ring_empty (pControlRing))
+                                                                {
+                                                                printf ("setting all ring entries to NULL\n");
+                                                                for (i=0;i<MAX_HASH_OBJECT_PER_REQUEST;i++)
+       		                                                        {
+                                                                        //...Can optimize more here TODO
+                                                                        if(pIpV6ControlHashObjectArray[lcore_id][i])
+                                                                   	     {
+                                                                             rte_free (pIpV6ControlHashObjectArray[lcore_id][i]);
+                                                                             pIpV6ControlHashObjectArray[lcore_id][i] = NULL;
+                                                                             }
+                                                                        }
+                                                                }
+                                                        //Add a hash entry for control DOWN TEID
+                                                        while (pIpV6ControlHashObjectArray[lcore_id][objCount] != NULL )
+                                                                objCount++;
+                                                        if (objCount > MAX_HASH_OBJECT_PER_REQUEST )
+                                                                {
+                                                                printf ("FATAL: dropping pdp request msg\n");
+
+                                                                return Aok;
+                                                                }
+                                                        pIpV6ControlHashObjectArray[lcore_id][objCount] = (struct sessionIdIpV6HashObject *) rte_malloc ("hash object array",sizeof(struct sessionIdIpV6HashObject),0);
+                                                        //...downlink ip and control plane teid.
+                                                        pIpV6ControlHashObjectArray[lcore_id][objCount]->ipUserV4  = 0x0;
+                                                        pIpV6ControlHashObjectArray[lcore_id][objCount]->ipControl[0] = dupKeyV6.ip_dst[0];
+                                                        pIpV6ControlHashObjectArray[lcore_id][objCount]->ipControl[1] = dupKeyV6.ip_dst[1];
+                                                        pIpV6ControlHashObjectArray[lcore_id][objCount]->ipControl[2] = dupKeyV6.ip_dst[2];
+                                                        pIpV6ControlHashObjectArray[lcore_id][objCount]->ipControl[3] = dupKeyV6.ip_dst[3];
+
+                                                        pIpV6ControlHashObjectArray[lcore_id][objCount]->controlTeid  =  dupKeyV6.teid;
+                                                        pIpV6ControlHashObjectArray[lcore_id][objCount]->addDeleteFlag = RELEASE_BEARER_GTPV2_SESSION ;
+                                                        printf ("sks:ret =%d ENQUEUING up teid=x0x%x\n", ret, sessionIdControlHashTableIPV6GTPV2[ret].controlTeid);
+
+                                                        ret = rte_ring_mp_enqueue (pControlRing, (void *)pIpV6ControlHashObjectArray[lcore_id][objCount]);
+
+                                                        printf ("sks: ring %s, ring count=%u\n", pControlRing->name, rte_ring_count (pControlRing));
+                                                        if (ret != 0 )
+                                 	                       printf ("error in enqueuing to sessionIdRing\n");
+                                                        lteAppendage.gtpSessionId = pIpV6ControlHashObjectArray[lcore_id][objCount]->sessionId ;
+                                                        rte_memcpy(pLteAppendage, &lteAppendage,sizeof(struct LteInfoAppend) );
+                                                        //TODO -All done transmit it out right here if possible, since i/f number is avail
+                                                        //a(pSessionIdObj->intf)
+                                                        gtpStats.gtpV2IpV6CtrlPkt++;
+							lte_send_packet (m, 2);
+                                                        return Aok;
+							}
+							break;
                                                 case GTPV2_CREATE_BEARER_REQUEST     : //...intentional fall-thru create bearer req/resp AND modify bearer req/resp 
                                                 case GTPV2_CREATE_BEARER_RESPONSE    : 
                                                 case GTPV2_MODIFY_BEARER_REQUEST     : 
@@ -1459,43 +1526,47 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
 
                                                 if (rte_cpu_to_be_32(keyV6.flagsMsgTypeAndLen) & GTPV2_TEID_PRESENT)
                                                         {
-                                                        printf ("sks: gtpv2 bearer TEID is present\n");
+                                                        //printf ("sks: gtpv2 bearer TEID is present\n");
                                                         pGtpV2Header = (struct GtpV2Header *)((unsigned char *)ipv6_hdr + sizeof(struct ipv6_hdr) + sizeof (struct udp_hdr) );
                                                         pGtpParser = (unsigned char * ) ( (unsigned char *)pGtpV2Header  + sizeof(struct GtpV2Header) );
-							dupKeyV6.teid = ((struct GtpV2Header *)pGtpV2Header)->teid;
+							dupKeyV6.teid = rte_cpu_to_be_32(((struct GtpV2Header *)pGtpV2Header)->teid);
                                                         }
                                                 else
                                                         {
                                                         pGtpV2Header = (struct GtpV2Header_noTeid *)((unsigned char *)ipv6_hdr + sizeof(struct ipv6_hdr) + sizeof (struct udp_hdr) );
                                                         pGtpParser = (unsigned char * ) ( (unsigned char *)pGtpV2Header  + sizeof(struct GtpV2Header_noTeid) );
-							printf ("sks: need to increment a stat, exiting processing this pkt since no teid in hdr and is not a create mgs\n");
+							//printf ("sks: need to increment a stat, exiting processing this pkt since no teid in hdr and is not a create mgs\n");
 							return Aok;
                                                         }
-
+						printf ("looking up control ip=0x%x:0x%x:0x%x:0x%x, teid = 0x%x\n", dupKeyV6.ip_dst[0], dupKeyV6.ip_dst[1], dupKeyV6.ip_dst[2], dupKeyV6.ip_dst[3],dupKeyV6.teid);
                                                 ret = rte_hash_lookup(pSessionIdV6GtpV2ControlHashTable,(const void *)&dupKeyV6);
+						if (ret <= 0 ) 
+							{
+						printf ("error looking up control ip=0x%x:0x%x:0x%x:0x%x, teid = 0x%x\n", dupKeyV6.ip_dst[0], dupKeyV6.ip_dst[1], dupKeyV6.ip_dst[2], dupKeyV6.ip_dst[3],dupKeyV6.teid);
+							}
 						if (ret > 0 )
 							{
 							octets = 1;
 	                                                while ((octets < (int)(rte_cpu_to_be_32(keyV6.flagsMsgTypeAndLen) & 0x0000FFFF)) )
                                                         	{
                                                         	gtpType = (int)(*pGtpParser);
-                                                        	printf ("sks: gtpV2type=0x%x\n", gtpType);
+                                                        	//printf ("sks: gtpV2type=0x%x\n", gtpType);
                                                                 if (gtpType ==GTPV2_TYPE_BEARER_CONTEXT)
 	                                                                {
                                                                         pGtpParser += sizeof(uint8_t);
                                                                         octets++;
                                                                         int bearerLen = rte_cpu_to_be_16(*((uint16_t *)pGtpParser));
-                                                                        //printf ("sks:bearerlen %d\n", bearerLen);
+                                                                        printf ("sks:bearerlen %d\n", bearerLen);
                                                                         //jump over 3 octets - 2 octets for length and 1 octet for spare and instance
                                                                         pGtpParser +=(3*sizeof(uint8_t));
                                                                         octets += 3;
                                                                         while (bearerLen > 0)
         	                                                                {
                                                                                 gtpType = (int)(*pGtpParser);
-                                                                                //printf ("bearer context type = 0x%x\n", gtpType);
+                                                                                printf ("bearer context type = 0x%x\n", gtpType);
                                                                                 if (gtpType == GTPV2_TYPE_FTEID)
                		                                                                {
-                                                                                        printf ("sks: fteid in bearer request found\n");
+                                                                                        //printf ("sks: fteid in bearer request found\n");
                                                                                         pGtpParser += sizeof (uint8_t);
                                                                                         octets++;
                                                                                         bearerLen--;
@@ -1506,7 +1577,8 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
 											//...4th octet is for ipv4/v6
 											//...have to do this chk irrespective of what the ethernet header for this pkt says
 											//...we might have an ipv4 or an ipv6 fteid in the bc for modify/create bearer msgs
-											if ( *pGtpParser == 0x40 )
+											ipType = *pGtpParser;
+											if ( ipType & 0x40 )
 												{
 												//...ipv6 addr
                                                                                         	pGtpParser += sizeof(uint8_t);
@@ -1540,6 +1612,7 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                                 					printf ("Cannot find ring %s\n", name);
                                                                 					return Aok;
                                                                 					}
+												
 
                                                         					if (rte_ring_empty (pControlRing))
                                                                 					{
@@ -1579,18 +1652,21 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
 												pIpV6ControlHashObjectArray[lcore_id][objCount]->dataTeid  =  dataTeid;
 												pIpV6ControlHashObjectArray[lcore_id][objCount]->controlTeid  =  sessionIdControlHashTableIPV6GTPV2[ret].controlTeid;
 												pIpV6ControlHashObjectArray[lcore_id][objCount]->addDeleteFlag = ADD_BEARER_GTPV2_SESSION ;
-
+												printf ("sks:ret =%d ENQUEUING up teid=x0x%x\n", ret, sessionIdControlHashTableIPV6GTPV2[ret].controlTeid);
 												ret = rte_ring_mp_enqueue (pControlRing, (void *)pIpV6ControlHashObjectArray[lcore_id][objCount]);
+
+												printf ("sks: ring %s, ring count=%u\n", pControlRing->name, rte_ring_count (pControlRing));
                                                         					if (ret != 0 )
                                                                 					printf ("error in enqueuing to sessionIdRing\n");
                                                         					lteAppendage.gtpSessionId = pIpV6ControlHashObjectArray[lcore_id][objCount]->sessionId ;
                                                         					rte_memcpy(pLteAppendage, &lteAppendage,sizeof(struct LteInfoAppend) );
                                                        						//TODO -All done transmit it out right here if possible, since i/f number is avail 
                                                        						//a(pSessionIdObj->intf)
-                                                       						gtpStats.gtpV1IpV6CtrlPkt++;
+                                                       						gtpStats.gtpV2IpV6CtrlPkt++;
+												lte_send_packet (m,2);
 												return Aok;
 											        }	
-											if ( *pGtpParser == 0x80 )
+											if ( ipType & 0x80 )
 												{
 												//...ipv4 addr
                                                                                         	pGtpParser += sizeof(uint8_t);
@@ -1616,7 +1692,6 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                                                                         printf ("Cannot find ring %s\n", name);
                                                                                                         return Aok;
                                                                                                         }
-
                                                                                                 if (rte_ring_empty (pControlRing))
                                                                                                         {
                                                                                                         printf ("setting all ring entries to NULL\n");
@@ -1656,14 +1731,14 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                                                                 pIpV6ControlHashObjectArray[lcore_id][objCount]->dataTeid  =  dataTeid;
                                                                                                 pIpV6ControlHashObjectArray[lcore_id][objCount]->controlTeid  =  sessionIdControlHashTableIPV6GTPV2[ret].controlTeid;
                                                                                                 pIpV6ControlHashObjectArray[lcore_id][objCount]->addDeleteFlag = ADD_BEARER_GTPV2_SESSION ;
-
                                                                                                 ret = rte_ring_mp_enqueue (pControlRing, (void *)pIpV6ControlHashObjectArray[lcore_id][objCount]);
                                                                                                 if (ret != 0 )
                                                                                                         printf ("error in enqueuing to sessionIdRing\n");
                                                                                                 lteAppendage.gtpSessionId = pIpV4ControlHashObjectArray[lcore_id][objCount]->sessionId ;
                                                                                                 rte_memcpy(pLteAppendage, &lteAppendage,sizeof(struct LteInfoAppend) );
                                                                                                 //TODO -All done transmit it out right here if possible, since i/f number is avail (pSessionIdObj->intf)
-                                                                                                gtpStats.gtpV1IpV4CtrlPkt++; 
+                                                                                                gtpStats.gtpV2IpV6CtrlPkt++; 
+												lte_send_packet(m,2);
 												return Aok;
 
 												}
@@ -1698,12 +1773,12 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                         if (repeatCount == 0 )
                                                                 {
 								
-                                                                printf ("sks:init timer case 4...\n");
+                                                                //printf ("sks:init timer case 4...\n");
                                                                 struct rte_timer * pUserPlaneTimer;
                                                                 pUserPlaneTimer = (struct rte_timer *) rte_malloc ("userplane timer",sizeof (struct rte_timer),0);
                                                                 int resetReturn = 0;
                                                                 rte_timer_init (pUserPlaneTimer);
-                                                                printf ("sks: timer reset...\n");
+                                                                //printf ("sks: timer reset...\n");
                                                                 lcore_id = rte_lcore_id ();
                                                                 resetReturn = rte_timer_reset (pUserPlaneTimer,RETRY_TIMEOUT,SINGLE,lcore_id,pktRetryTimerCb,(void *)m);
                                                                 printf ("sks: returning nok resetReturn=%d...\n", resetReturn);
@@ -1712,6 +1787,7 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                         if (repeatCount == 1)
                                                                 {
                                                                 //...orphan pkt, update stats and discard.
+                                                                gtpStats.gtpV2IpV6ControlPktDiscards++;
                                                                 return Aok;
 								}
 							}
@@ -1719,10 +1795,11 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
 						break;
 						case GTPV2_CREATE_SESSION_RESPONSE   :  //...intentional fall-thru
                                                 case GTPV2_CREATE_SESSION_REQUEST    : 
-						printf ("sks: got gtpv2 create request\n");
+						printf ("sks: got gtpv2 create request/resp\n");
+
 						if (rte_cpu_to_be_32(keyV6.flagsMsgTypeAndLen) & GTPV2_TEID_PRESENT)
 							{
-							printf ("sks: gtpv2 ipv6 create session req/resp TEID is present\n");
+							//printf ("sks: gtpv2 ipv6 create session req/resp TEID is present\n");
 							pGtpV2Header = (struct GtpV2Header *)((unsigned char *)ipv6_hdr + sizeof(struct ipv6_hdr) + sizeof (struct udp_hdr) );
 							pGtpParser = (unsigned char * ) ( (unsigned char *)pGtpV2Header  + sizeof(struct GtpV2Header) );
 							}
@@ -1733,11 +1810,11 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
 							}						
 						octets = 1;
                                                 sGsnIpV6ControlAddr[0]=sGsnIpV6ControlAddr[1]=sGsnIpV6ControlAddr[2]=sGsnIpV6ControlAddr[3]=0;
-						printf ("sks: gtpv2 pkt len=0x%x\n", (rte_cpu_to_be_32(keyV6.flagsMsgTypeAndLen) & 0x0000FFFF));
+						//printf ("sks: gtpv2 pkt len=0x%x\n", (rte_cpu_to_be_32(keyV6.flagsMsgTypeAndLen) & 0x0000FFFF));
                                                 while ((octets < (int)(rte_cpu_to_be_32(keyV6.flagsMsgTypeAndLen) & 0x0000FFFF))&& (sGsnIpV6ControlAddr[0] == 0) &&(sGsnIpV6ControlAddr[1]==0) && (sGsnIpV6ControlAddr[2]==0) && (sGsnIpV6ControlAddr[3]==0))
 							{
 							gtpType = (int)(*pGtpParser);
-							printf ("sks: gtpV2type=0x%x\n", gtpType);
+							//printf ("sks: gtpV2type=0x%x\n", gtpType);
 					 		if (gtpType == GTPV2_TYPE_FTEID)
 								{
 								pGtpParser += sizeof (uint8_t);
@@ -1776,6 +1853,45 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                 //Check for duplicate
                                                 union ipv6_3tuple_host dupKey;
                                                 bzero (&dupKey, sizeof(dupKey));
+
+                                                if ((rte_cpu_to_be_32(keyV6.flagsMsgTypeAndLen) & 0x00FF0000 )== GTPV2_CREATE_SESSION_RESPONSE)
+                                                        {
+                                                        //...Tie the pdp response and request together with the same sessioId
+                                                        dupKey.ip_dst[0] = rte_cpu_to_be_32(keyV6.ip_dst[0]);
+                                                        dupKey.ip_dst[1] = rte_cpu_to_be_32(keyV6.ip_dst[1]);
+                                                        dupKey.ip_dst[2] = rte_cpu_to_be_32(keyV6.ip_dst[2]);
+                                                        dupKey.ip_dst[3] = rte_cpu_to_be_32(keyV6.ip_dst[3]);
+                                                        dupKey.teid = rte_cpu_to_be_32(key.teid);
+                                                        ret = rte_hash_lookup(pSessionIdV6GtpV2ControlHashTable, (const void *)&dupKey);
+                                                        if (ret > 0)
+                                                                {
+                                                                //...pdp create request entry found, get the sessionId
+                                                                createReqSessionId = sessionIdControlHashTableIPV6GTPV2[ret].sessionId;
+                                                                }
+                                                        else
+                                                                {
+                                                                //...received create response earlier than create request, kick off timer and wait
+                                                                if (repeatCount == 0 )
+                                                                        {
+                                                                        printf ("sks:init timer case 6...\n");
+                                                                        struct rte_timer * pUserPlaneTimer;
+                                                                        pUserPlaneTimer = (struct rte_timer *) rte_malloc ("userplane timer",sizeof (struct rte_timer),0);
+                                                                        int resetReturn = 0;
+                                                                        rte_timer_init (pUserPlaneTimer);
+                                                                        printf ("sks: timer reset...\n");
+                                                                        lcore_id = rte_lcore_id ();
+                                                                        resetReturn = rte_timer_reset (pUserPlaneTimer,RETRY_TIMEOUT,SINGLE,lcore_id,pktRetryTimerCb,(void *)m);
+                                                                        printf ("sks: returning nok resetReturn=%d...\n", resetReturn);
+                                                                        return Nok;
+                                                                        }
+                                                                if (repeatCount == 1)
+                                                                        {
+                                                                        //orphan pkt, update stat and return
+                                                                        gtpStats.gtpV2CtrlPktDiscards++;
+                                                                        return Aok;
+                                                                        }
+                                                                }
+                                                        }
                                                 dupKey.ip_dst[0] = sGsnIpV6ControlAddr[0];
                                                 dupKey.ip_dst[1] = sGsnIpV6ControlAddr[1];
                                                 dupKey.ip_dst[2] = sGsnIpV6ControlAddr[2];
@@ -1788,10 +1904,12 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                         //it is a duplicate, append sessionId and tx out
                                                         pSessionIdObjGtpV2IPV6 = &sessionIdControlHashTableIPV6GTPV2[ret];
                                                         lteAppendage.gtpSessionId = pSessionIdObjGtpV2IPV6->sessionId;
-                                                        printf ("detected duplicate pdp request, ready to send out pkt...\n");
+                                                        //printf ("detected duplicate pdp request, ready to send out pkt...\n");
                                                         rte_memcpy(pLteAppendage, &lteAppendage,sizeof(struct LteInfoAppend) );
                                                         //TODO - All done, transmit it out right here if possible, since i/f number is avail (pSessionIdObj->intf)
                                                         gtpStats.gtpV2IpV6CtrlPkt++;
+							lte_send_packet (m, 2);
+							return Aok;
                                                         }
                                                 else
                                                         {
@@ -1802,14 +1920,13 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                         rte_snprintf(name, sizeof(name), "sessionIdAddV6Control_ring%u_io%u_sId4",
                                                                         socketid,
                                                                         lcore_id);
-
+							printf("sks: writing to ring %s\n", name);
                                                         pControlRing = rte_ring_lookup (name);
                                                         if (pControlRing == NULL )
                                                                 {
                                                                 printf ("Cannot find ring %s\n", name);
                                                                 return Aok;
                                                                 }
-
                                                         if (rte_ring_empty (pControlRing))
                                                                 {
                                                                 printf ("setting all ring entries to NULL\n");
@@ -1881,29 +1998,85 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
 											//printf ("bearer context type = 0x%x\n", gtpType);
                			                                        		if (gtpType == GTPV2_TYPE_FTEID)
        		                                                        			{
-												printf ("sks: fteid in bearer request found\n");
-                                                                				pGtpParser += sizeof (uint8_t);
-                                                                				octets++;
-												bearerLen--;
-                                                                				fwdLen = rte_cpu_to_be_16(*((uint16_t *)pGtpParser));
-                                                                				pGtpParser +=(4*sizeof(uint8_t)); //2 octets for len and 2 octets for CR flag, instance and ipv4/v6 flag
-                                                                				octets+=4;
-												bearerLen -=4;
-                                                                				dataTeid = rte_cpu_to_be_32(*((uint32_t *)pGtpParser)); //only get teid/gre key
-                                                                				pGtpParser += 4*sizeof(uint8_t);
-                                                                				octets+=4;
-												bearerLen -=4;
+                                                                                        	printf ("sks: ipv6 fteid in bearer request found\n");
+                                                                                        	pGtpParser += sizeof (uint8_t);
+                                                                                        	octets++;
+                                                                                        	bearerLen--;
+                                                                                        	fwdLen = rte_cpu_to_be_16(*((uint16_t *)pGtpParser));
+                                                                                        	pGtpParser +=(3*sizeof(uint8_t)); //2 octets for len and 1 octets for CR flag,
+                                                                                        	octets+=3;
+                                                                                        	bearerLen -=3;
+                                                                                        	//...4th octet is for ipv4/v6
+                                                                                        	//...have to do this chk irrespective of what the ethernet header for this pkt says
+                                                                                        	//...we might have an ipv4 or an ipv6 fteid in the bc for modify/create bearer msgs
+												ipType = *pGtpParser; 
+                                                                                        	printf ("sks: ip type = 0x%x\n", ipType);
+                                                                                        	if ( ipType & 0x40 )
+                                                                                                	{
+                                                                                                	//...ipv6 addr
+                                                                                                	pGtpParser += sizeof(uint8_t);
+                                                                                                	octets ++;
+                                                                                                	bearerLen --;
+                                                                                                	dataTeid = rte_cpu_to_be_32(*((uint32_t *)pGtpParser)); //only get teid/gre key
+                                                                                                	pGtpParser += 4*sizeof(uint8_t);
+                                                                                                	octets+=4;
+                                                                                                	bearerLen -=4;
+                                                                                                	sGsnIpV6ControlAddr[0] =  rte_cpu_to_be_32(*((uint32_t *)pGtpParser));
+	                                                                                                pGtpParser += 4*sizeof(uint8_t);
+	                                                                                                sGsnIpV6ControlAddr[1] =  rte_cpu_to_be_32(*((uint32_t *)pGtpParser));
+	                                                                                                pGtpParser += 4*sizeof(uint8_t);
+	                                                                                                sGsnIpV6ControlAddr[2] =  rte_cpu_to_be_32(*((uint32_t *)pGtpParser));
+	                                                                                                pGtpParser += 4*sizeof(uint8_t);
+	                                                                                                sGsnIpV6ControlAddr[3] =  rte_cpu_to_be_32(*((uint32_t *)pGtpParser));
+	                                                                                                pGtpParser += 4*sizeof(uint8_t);
+	                                                                                                octets += 16;
+	                                                                                                bearerLen -= 16;
+	                                                                                                //create  a new entry in hash table
+	                                                                                                //cleanup hash object array first
+	                                                                                                //...downlink ip and control plane teid.
+	
+	                                                                                                pIpV6ControlHashObjectArray[lcore_id][objCount]->ipUserV4 = 0x0;
+	                                                                                                pIpV6ControlHashObjectArray[lcore_id][objCount]->ipUser[0] = sGsnIpV6ControlAddr[0];
+	                                                                                                pIpV6ControlHashObjectArray[lcore_id][objCount]->ipUser[1] = sGsnIpV6ControlAddr[1];
+	                                                                                                pIpV6ControlHashObjectArray[lcore_id][objCount]->ipUser[2] = sGsnIpV6ControlAddr[2];
+	                                                                                                pIpV6ControlHashObjectArray[lcore_id][objCount]->ipUser[3] = sGsnIpV6ControlAddr[3];
+	                                                                                                pIpV6ControlHashObjectArray[lcore_id][objCount]->dataTeid  =  dataTeid;
+	                                                                                                }
+	                                                                                        if ( ipType & 0x80 )
+	                                                                                                {
+	                                                                                                //...ipv4 addr
+	                                                                                                pGtpParser += sizeof(uint8_t);
+	                                                                                                octets ++;
+	                                                                                                bearerLen --;
+	                                                                                                dataTeid = rte_cpu_to_be_32(*((uint32_t *)pGtpParser)); //only get teid/gre key
+	                                                                                                pGtpParser += 4*sizeof(uint8_t);
+	                                                                                                octets+=4;
+	                                                                                                bearerLen -=4;
+	                                                                                                sGsnIpV4UserAddr =  rte_cpu_to_be_32(*((uint32_t *)pGtpParser));
+	                                                                                                pGtpParser += 4*sizeof(uint8_t);
+	                                                                                                octets += 4;
+	                                                                                                bearerLen -= 4;
+	                                                                                                //...downlink ip and control plane teid.
+	
+	                                                                                                pIpV6ControlHashObjectArray[lcore_id][objCount]->ipUserV4 = sGsnIpV4UserAddr;
+													printf ("sks: setting ipUserV4 to crap value of 0x%x\n", sGsnIpV4UserAddr);
+	                                                                                                pIpV6ControlHashObjectArray[lcore_id][objCount]->ipUser[0] = 0x0;
+	                                                                                                pIpV6ControlHashObjectArray[lcore_id][objCount]->ipUser[1] = 0x0;
+	                                                                                                pIpV6ControlHashObjectArray[lcore_id][objCount]->ipUser[2] = 0x0;
+	                                                                                                pIpV6ControlHashObjectArray[lcore_id][objCount]->ipUser[3] = 0x0;
+	                                                                                                pIpV6ControlHashObjectArray[lcore_id][objCount]->dataTeid  =  dataTeid;
+													}
 												}
-                                                        				else
-                                                                				{
-                                                                				pGtpParser += sizeof (uint8_t);
-                                                                				octets++;
+	                                                        			else
+	                                                                			{
+       		                                                         			pGtpParser += sizeof (uint8_t);
+	                                                                			octets++;
 												bearerLen--;
-                                                                				fwdLen = rte_cpu_to_be_16(*((uint16_t *)pGtpParser));
-                                                                				pGtpParser += (fwdLen +3)* sizeof(uint8_t);
-                                                                				octets += fwdLen + 3;
+	                                                                			fwdLen = rte_cpu_to_be_16(*((uint16_t *)pGtpParser));
+	                                                                			pGtpParser += (fwdLen +3)* sizeof(uint8_t);
+	                                                                			octets += fwdLen + 3;
 												bearerLen -= fwdLen + 3;
-                                                                				}
+	                                                                			}
 											}
 										//printf ("came out of bearerlen loop with dataTeid=0x%x\n", dataTeid);
 										}
@@ -1918,10 +2091,19 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
 
 									}
 								}
-							printf ("sks: gtpV2, user teid=0x%x\n", dataTeid);
+							//printf ("sks: gtpV2, user teid=0x%x\n", dataTeid);
                                                        	pIpV6ControlHashObjectArray[lcore_id][objCount]->dataTeid       = dataTeid;
-                                                        globalSessionId = ((globalSessionId & 0x0000ffffffffffff)|(((uint64_t)lcore_id) << 48));
-                                                        pIpV6ControlHashObjectArray[lcore_id][objCount]->sessionId      = globalSessionId;
+							
+                                                        if (createReqSessionId != 0 )
+                                                                {
+                                                                pIpV6ControlHashObjectArray[lcore_id][objCount]->sessionId      = createReqSessionId;
+                                                                createReqSessionId = 0;
+                                                                }
+							else
+								{
+ 								printf ("sks: generating globalSessionId =0x%x\n", globalSessionId);
+                                                        	pIpV6ControlHashObjectArray[lcore_id][objCount]->sessionId      = globalSessionId++;
+								}
                                                         pIpV6ControlHashObjectArray[lcore_id][objCount]->addDeleteFlag  = ADD_GTPV2_SESSION;
 
                                                         if ((keyV6.teid != 0) && (((rte_cpu_to_be_32(keyV6.flagsMsgTypeAndLen) & 0x00FF0000)== GTPV2_CREATE_SESSION_REQUEST)))
@@ -1933,7 +2115,7 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                                 secKeyV6.ip_src[1] = sGsnIpV6ControlAddr[1];
                                                                 secKeyV6.ip_src[2] = sGsnIpV6ControlAddr[2];
                                                                 secKeyV6.ip_src[3] = sGsnIpV6ControlAddr[3];
-                                                                secKeyV6.teid      = keyV6.teid;
+                                                                secKeyV6.teid      = rte_cpu_to_be_32(keyV6.teid);
                                                                 ret = rte_hash_lookup(pSessionIdV6GtpV2ControlHashTable, (const void *)&secKeyV6);
                                                                 if (ret > 0 )
                                                                         {
@@ -1943,13 +2125,21 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                                         }
                                                                 }
 
-                                                        ret = rte_ring_mp_enqueue (pControlRing, (void *)pIpV6ControlHashObjectArray[lcore_id][objCount]);
+							printf ("control ip=0x%x:0x%x:0x%x:0x%x\n",pIpV6ControlHashObjectArray[lcore_id][objCount]->ipControl[0],pIpV6ControlHashObjectArray[lcore_id][objCount]->ipControl[1],pIpV6ControlHashObjectArray[lcore_id][objCount]->ipControl[2],pIpV6ControlHashObjectArray[lcore_id][objCount]->ipControl[3]);
+
+							printf ("ipuserV4 flag = 0x%x\n",pIpV6ControlHashObjectArray[lcore_id][objCount]->ipUserV4); 		
+			                                ret = rte_ring_mp_enqueue (pControlRing, (void *)pIpV6ControlHashObjectArray[lcore_id][objCount]);
+
+							printf ("sks: ring %s, ring count=%u\n", pControlRing->name, rte_ring_count (pControlRing));
                                                         if (ret != 0 )
                                                                 printf ("error in enqueuing to sessionIdRing\n");
-                                                        lteAppendage.gtpSessionId = globalSessionId++;
+                                                        lteAppendage.gtpSessionId = pIpV6ControlHashObjectArray[lcore_id][objCount]->sessionId;
+
                                                         rte_memcpy(pLteAppendage, &lteAppendage,sizeof(struct LteInfoAppend) );
                                                         //TODO -All done transmit it out right here if possible, since i/f number is avail (pSessionIdObj->intf)
-                                                        gtpStats.gtpV1IpV6CtrlPkt++;
+                                                        gtpStats.gtpV2IpV6CtrlPkt++;
+							lte_send_packet (m, 2);
+							return Aok;
                                                         }	
 						break;
 						}
@@ -1957,7 +2147,6 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                         }
 
                                 } //control plane if statement
-
 		}
         
 	if (ipPktType == PACKET_TYPE_IPV4) { if ( ipv4_hdr->next_proto_id    == IPPROTO_UDP ) {
@@ -1978,15 +2167,69 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
 		udpPortSrc = (uint16_t)(rte_cpu_to_be_16(pUdpHeader->src_port));
 		udpPortDst = (uint16_t)(rte_cpu_to_be_16(pUdpHeader->dst_port));
        		calculateTimeStamp (&currentTime);
+		lteAppendage.magic                 = 0xBACCFEED;
        		lteAppendage.secondTimeStamp       = currentTime.tv_sec;
        		lteAppendage.microSecondTimeStamp  = currentTime.tv_usec;
+                if (fragPresent == 1)
+                	{
+                        bzero (&fragKeyV4, sizeof (fragKeyV4));
+                        fragKeyV4.ip_addr = ipv4_hdr->dst_addr;
+                        fragKeyV4.fragId  = fragId;
+
+                        ret = rte_hash_lookup (pIpV4FragIdHashTable, (const void *)&fragKeyV4);
+                        if ( ret >  0 )
+                        	{
+                                //      ... found, get sessionid and transmit out and exit
+                                lteAppendage.gtpSessionId = ipV4fragIdHashTable[ret].sessionId;
+                                rte_memcpy(pLteAppendage, &lteAppendage,sizeof(struct LteInfoAppend) );
+                                //TODO - All done, transmit it out right here if possible, since i/f number is avail (pSessionIdObj->intf)
+                                gtpStats.gtpV1V2IpV4UserPktFragment++;
+				lte_send_packet (m, 2);
+                                //...return here itself since this is not a fully formed gtp pkt, hence
+                                //...will not be in the user hash tbl.
+                                return Aok;
+                                }
+                        else
+                                {
+                                //...fragment might have arrived before the first fragment
+                                //...kick off timer and wait
+
+                                if (repeatCount == 0 )
+                                	{
+                                        //printf ("sks:init timer case 2...\n");
+                                        struct rte_timer * pUserPlaneTimer;
+                                        pUserPlaneTimer = (struct rte_timer *) rte_malloc ("userplane timer",sizeof (struct rte_timer),0);
+                                        int resetReturn = 0;
+                                        rte_timer_init (pUserPlaneTimer);
+                                        //printf ("sks: timer reset...\n");
+                                        lcore_id = rte_lcore_id ();
+                                        resetReturn = rte_timer_reset (pUserPlaneTimer,RETRY_TIMEOUT,SINGLE,lcore_id,pktRetryTimerCb,(void *)m);
+                                        //printf ("sks: returning nok resetReturn=%d...\n", resetReturn);
+                                        return Nok;
+                                        }
+                                if (repeatCount == 1)
+                                        {
+                                        //...orphan pkt, update stats and discard.
+                                        gtpStats.gtpV1V2IpV4UserPktFragmentDiscards++;
+                                        return Aok;
+                                        }
+                                }
+                        }
 
       		if ((udpPortSrc == USERPLANE_GTP_PORT)||(udpPortDst == USERPLANE_GTP_PORT))
               		{
                         if (vlanTag == PACKET_NO_VLAN_TAG_PRESENT)
 				{
-                        	data0 = _mm_loadu_si128((__m128i*)(rte_pktmbuf_mtod(m, unsigned char *) + sizeof(struct ether_hdr)  + offsetof(struct ipv4_hdr,time_to_live)));
-                        	data1 = _mm_loadu_si128((__m128i*)(rte_pktmbuf_mtod(m, unsigned char *) + sizeof(struct ether_hdr)  + offsetof(struct ipv4_hdr,time_to_live)+sizeof(__m128i)));
+                                if (etherPktType !=  ETHER_PACKET_LINUX_COOKED)
+                                        {
+                                        data0 = _mm_loadu_si128((__m128i*)(rte_pktmbuf_mtod(m, unsigned char *) + sizeof(struct ether_hdr)  + offsetof(struct ipv4_hdr,time_to_live)));
+                                        data1 = _mm_loadu_si128((__m128i*)(rte_pktmbuf_mtod(m, unsigned char *) + sizeof(struct ether_hdr)  + offsetof(struct ipv4_hdr,time_to_live)+sizeof(__m128i)));
+                                        }
+                                else
+                                        {
+                                        data0 = _mm_loadu_si128((__m128i*)(rte_pktmbuf_mtod(m, unsigned char *) + sizeof(struct ether_hdr)  + offsetof(struct ipv4_hdr,time_to_live))+sizeof (uint16_t));
+                                        data1 = _mm_loadu_si128((__m128i*)(rte_pktmbuf_mtod(m, unsigned char *) + sizeof(struct ether_hdr)  + offsetof(struct ipv4_hdr,time_to_live)+sizeof(__m128i))+sizeof(uint16_t));
+                                        }
 				}
 			else
 				{
@@ -2008,18 +2251,79 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
 				}
                         if (ret > 0)
                                 {
+                                if (fragPresent == 1 )
+                                        {
+                                        lcore_id = rte_lcore_id();
+                                        socketid = rte_lcore_to_socket_id(rte_lcore_id( ) );
+                                        rte_snprintf(name, sizeof(name), "FragId_ring%u_io%u_sId4",
+                                                             socketid,
+                                                             lcore_id);
+
+                                        pFragIdRing = rte_ring_lookup (name);
+                                        if (pFragIdRing == NULL )
+                                                {
+                                                printf ("Cannot find ring %s\n", name);
+                                                return Aok;
+                                                }
+                                        if (rte_ring_empty (pFragIdRing))
+                                                {
+                                                printf ("setting all ring entries to NULL\n");
+                                                for (i=0;i<MAX_HASH_OBJECT_PER_REQUEST;i++)
+                                                        {
+                                                        //...Can optimize more here TODO
+                                                        if(pFragIdHashObjectArray[lcore_id][i])
+                                                                {
+                                                                rte_free (pFragIdHashObjectArray[lcore_id][i]);
+                                                                pFragIdHashObjectArray[lcore_id][i] = NULL;
+                                                                }
+                                                        }
+                                                }
+
+                                        while (pFragIdHashObjectArray[lcore_id][objCount] != NULL )
+                                                objCount++;
+
+                                        if (objCount > MAX_HASH_OBJECT_PER_REQUEST )
+                                                {
+                                                printf ("FATAL: dropping pdp request msg\n");
+                                                return Aok;
+                                                }
+
+                                        pFragIdHashObjectArray[lcore_id][objCount] = (struct fragIdHashObject *) rte_malloc ("hash object  v6 array",sizeof(struct sessionIdIpV6HashObject),0);
+
+                                        pFragIdHashObjectArray[lcore_id][objCount]->ipV6DstAddr[0]           = 0x0;
+                                        pFragIdHashObjectArray[lcore_id][objCount]->ipV6DstAddr[1]           = 0x0;
+                                        pFragIdHashObjectArray[lcore_id][objCount]->ipV6DstAddr[2]           = 0x0;
+                                        pFragIdHashObjectArray[lcore_id][objCount]->ipV6DstAddr[3]           = 0x0;
+                                        pFragIdHashObjectArray[lcore_id][objCount]->ipV4DstAddr              = newKey.ip_dst;
+                                        pFragIdHashObjectArray[lcore_id][objCount]->sessionId                = sessionIdUserHashTableIPV4[ret].sessionId;
+                                        pFragIdHashObjectArray[lcore_id][objCount]->fragId                   = fragId;
+					
+                                        ret = rte_ring_mp_enqueue (pFragIdRing, (void *) pFragIdHashObjectArray[lcore_id][objCount]);
+
+
+                                        if (ret != 0 )
+                                                {
+                                                printf ("error in enqueuing to sessionIdRing\n");
+                                                return Aok;
+                                                }
+                                        gtpStats.gtpV1V2IpV4UserPktFragment++;
+                                        }
+
+
                                 pSessionIdUserObj = &sessionIdUserHashTableIPV4[ret];
                                 lteAppendage.gtpSessionId = pSessionIdUserObj->sessionId;
                                 //p
                                 //intf ("sks: user plane pkt, hash lkup sucessful, ready to send out pkt...\n");
                                 rte_memcpy(pLteAppendage, &lteAppendage,sizeof(struct LteInfoAppend) );
                                 //TODO - All done, transmit it out right here if possible, since i/f number is avail (pSessionIdObj->intf)
-                                gtpStats.gtpV1IpV4UserPkt++;
+                                gtpStats.gtpV1V2IpV4UserPkt++;
+				lte_send_packet (m, 2);
+				return Aok;
                                 }
 			if (ret < 0)
 				{
 				////TODO - session not yet initiated but we have rx user data, kickoff timer and wait.
-                                printf ("sks: entry does not exist for user plane pkt, repeatCount=%d returning...\n", repeatCount);
+                                printf ("sks: entry does not exist for user plane pkt ipaddr=0x%x, teid=0x%x, repeatCount=%d returning...\n",newKey.ip_dst,newKey.teid, repeatCount);
                                 if (repeatCount == 0 )
                                         {
                                         //...start timer, userplane pkt has arrived early
@@ -2037,6 +2341,7 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                  if (repeatCount == 1)
                                         {
                                         //...orphan pkt, update stats and discard.
+                                        gtpStats.gtpV1V2IpV4UserPktDiscards++;
 					printf ("sks, timer ticked, still entry is not there, returning...\n");
                                         return Aok;
                                         }
@@ -2046,18 +2351,29 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                       	 {
                          if (vlanTag == PACKET_NO_VLAN_TAG_PRESENT)
 				{
-                         	data0 = _mm_loadu_si128((__m128i*)(rte_pktmbuf_mtod(m, unsigned char *) + sizeof(struct ether_hdr)  + offsetof(struct ipv4_hdr,time_to_live)));
-                         	data1 = _mm_loadu_si128((__m128i*)(rte_pktmbuf_mtod(m, unsigned char *) + sizeof(struct ether_hdr)  + offsetof(struct ipv4_hdr,time_to_live)+sizeof(__m128i)));
+                                if (etherPktType !=  ETHER_PACKET_LINUX_COOKED)
+                                        {
+					//rte_pktmbuf_dump(m,100);
+                                        data0 = _mm_loadu_si128((__m128i*)(rte_pktmbuf_mtod(m, unsigned char *) + sizeof(struct ether_hdr)  + offsetof(struct ipv4_hdr,time_to_live)));
+                                        data1 = _mm_loadu_si128((__m128i*)(rte_pktmbuf_mtod(m, unsigned char *) + sizeof(struct ether_hdr)  + offsetof(struct ipv4_hdr,time_to_live)+sizeof(__m128i)));
+                                        }
+                                else
+                                        {
+                                        data0 = _mm_loadu_si128((__m128i*)(rte_pktmbuf_mtod(m, unsigned char *) + sizeof(struct ether_hdr)  + offsetof(struct ipv4_hdr,time_to_live) + sizeof(uint16_t)));
+                                        data1 = _mm_loadu_si128((__m128i*)(rte_pktmbuf_mtod(m, unsigned char *) + sizeof(struct ether_hdr)  + offsetof(struct ipv4_hdr,time_to_live)+sizeof(__m128i)+ sizeof(uint16_t)));
+                                        }
 				}
 			else
 				{
                                 data0 = _mm_loadu_si128((__m128i*)(rte_pktmbuf_mtod(m, unsigned char *) + sizeof(struct ether_hdr)  + sizeof (struct vlan_hdr) + offsetof(struct ipv4_hdr,time_to_live)));
                                 data1 = _mm_loadu_si128((__m128i*)(rte_pktmbuf_mtod(m, unsigned char *) + sizeof(struct ether_hdr)  + sizeof (struct vlan_hdr) + offsetof(struct ipv4_hdr,time_to_live)+sizeof(__m128i)));
+
 				}
  
-			 key.xmm[0] = _mm_and_si128(data0, ipV4HashMask0);
+			 key.xmm[0] = _mm_and_si128(data0, ipV4HashMask2);
                          key.xmm[1] = _mm_and_si128(data1, ipV4HashMask0);
-	    	         printf ("sks: flags=0x%x\n", key.flagsMsgTypeAndLen);
+
+	    	         printf ("sks: flags=0x%x ipdst=0x%x\n", key.flagsMsgTypeAndLen, rte_cpu_to_be_32(key.ip_dst));
                                 if (rte_cpu_to_be_32(key.flagsMsgTypeAndLen) & GTP_VERSION1_IN_FLAGS)
                                         {
                                         //GTPv1 processing
@@ -2078,13 +2394,32 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                			newKey.ip_dst = rte_cpu_to_be_32(key.ip_dst);
                                         	newKey.teid   = rte_cpu_to_be_32(key.teid);
 
-                                               	printf ("sks: got delete request/response msg dst=0x%x, teid = 0x%x\n",newKey.ip_dst, newKey.teid);
+                                               	printf ("sks: ipv4 got delete request/response msg dst=0x%x, teid = 0x%x srcip=0x%x\n",newKey.ip_dst, newKey.teid, key.ip_src);
  						ret = rte_hash_lookup(pSessionIdV4ControlHashTable, (const void *)&newKey);
 						if (ret < 0 )
 							{
-							printf ("orphan delete context request/response\n");
-							//TODO: tx it out nevertheless
-							return Aok;
+							printf ("ipv4 orphan delete context request/response\n");
+                                                        if (repeatCount == 0 )
+                                                                {
+                                                                printf ("sks:init timer case 3...\n");
+                                                                struct rte_timer * pUserPlaneTimer;
+                                                                pUserPlaneTimer = (struct rte_timer *) rte_malloc ("userplane timer",sizeof (struct rte_timer),0);
+                                                                int resetReturn = 0;
+                                                                rte_timer_init (pUserPlaneTimer);
+                                                                printf ("sks: timer reset...\n");
+                                                                lcore_id = rte_lcore_id ();
+                                                                resetReturn = rte_timer_reset (pUserPlaneTimer,RETRY_TIMEOUT,SINGLE,lcore_id,pktRetryTimerCb,(void *)m);
+                                                                printf ("sks: returning nok resetReturn=%d...\n", resetReturn);
+                                                                return Nok;
+                                                                }
+                                                        if (repeatCount == 1)
+                                                                {
+                                                                //...orphan pkt, update stats and discard.
+                                                                gtpStats.gtpV1IpV4ControlPktDiscards++;
+								//...TODO: tx it out nevertheless
+								lte_send_packet (m, 2);
+                                                                return Aok;
+                                                                }
 							}
 						else
 							{
@@ -2099,9 +2434,9 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                         	{
                                                                 printf ("Cannot find ring %s\n", name);
 								//TODO:tx it out nevertheless
+								lte_send_packet (m, 2);
                                                                 return Aok;
                                                                 }
-
                                                         if (rte_ring_empty (pControlRing))
                                                                 {
                                                                 printf ("setting all ring entries to NULL\n");
@@ -2123,6 +2458,7 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                                 {
                                                                 printf ("FATAL: dropping pdp request msg\n");
 								//TODO: tx it out
+								lte_send_packet (m, 2);
                                                                 return Aok;
                                                                 }
 
@@ -2139,38 +2475,47 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                        	pIpV4ControlHashObjectArray[lcore_id][objCount]->controlTeid    = pSessionIdObj->controlTeid;
                                                        	pIpV4ControlHashObjectArray[lcore_id][objCount]->dataTeid       = pSessionIdObj->userTeid;
                                                         pIpV4ControlHashObjectArray[lcore_id][objCount]->addDeleteFlag  = DELETE_GTPV1_SESSION_NO_TEARDOWN;
+
+							lteAppendage.gtpSessionId = sessionIdControlHashTableIPV4[ret].sessionId;
+ 							printf ("sks:segregate:requests received sessId= 0x%x\n", lteAppendage.gtpSessionId);
+
+
 							if ( tearDownFlag == 0xff )
 								{
                                                                 pIpV4ControlHashObjectArray[lcore_id][objCount]->addDeleteFlag  = DELETE_GTPV1_SESSION_TEARDOWN;
 								}
 							printf ("sks: enqueueing delete msg objCount=%d\n", objCount);
 
+				
                                        			ret = rte_ring_mp_enqueue (pControlRing, (void *)pIpV4ControlHashObjectArray[lcore_id][objCount]);
                                                        	if (ret != 0 )
                                                        		{
                                                        		printf ("error in enqueuing to sessionIdRing\n");
                                                                	return Aok;
                                                                	}
-                                                    	printf ("sks:ring count %d\n", rte_ring_count (pControlRing)); 
-                                                	lteAppendage.gtpSessionId = sessionIdControlHashTableIPV4[ret].sessionId;
+
+
                                                 	rte_memcpy(pLteAppendage, &lteAppendage,sizeof(struct LteInfoAppend) );
 							printf ("sks: all done for delete request/resp msg\n");
                                                 	//TODO -All done transmit it out right here if possible, since i/f number is avail (pSessionIdObj->intf)
                                                 	gtpStats.gtpV1IpV4CtrlPkt++;
+							lte_send_packet (m, 2);
+							return Aok;
 							}
 						break;
 						case GTP_PDP_UPDATE_REQUEST://intentional fall-thru
+						printf ("sks:updt req\n");
 						case GTP_PDP_UPDATE_RESPONSE://intentional fall-thru
                                                 key.xmm[1] = _mm_and_si128(data1, ipV4HashMask2);
                                                 bzero (&newKey,sizeof(newKey));
                                                 newKey.ip_dst = rte_cpu_to_be_32(key.ip_dst);
                                                 newKey.teid   = rte_cpu_to_be_32(key.teid);
 
-                                                printf ("sks: got delete request/response msg dst=0x%x, teid = 0x%x\n",newKey.ip_dst, newKey.teid);
+                                                printf ("sks: ipv4 got update request/response msg dst=0x%x, teid = 0x%x ipsrc=0x%x\n",newKey.ip_dst, newKey.teid, rte_cpu_to_be_32(key.ip_src));
                                                 ret = rte_hash_lookup(pSessionIdV4ControlHashTable, (const void *)&newKey);
                                                 if (ret < 0 )
                                                         {
-                                                        printf ("orphan update context request/response\n");
+                                                        printf ("ipv4 orphan update context request/response\n");
                                                         // start a timer
 							//then tx it out if still not found
 			                                if (repeatCount == 0 )
@@ -2205,9 +2550,9 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                                 {
                                                                 printf ("Cannot find ring %s\n", name);
                                                                 //TODO:tx it out nevertheless
+                                                                lte_send_packet (m, 2);
                                                                 return Aok;
                                                                 }
-
                                                         if (rte_ring_empty (pControlRing))
                                                                 {
                                                                 printf ("setting all ring entries to NULL\n");
@@ -2229,6 +2574,7 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                                 {
                                                                 printf ("FATAL: dropping pdp request msg\n");
                                                                 //TODO: tx it out
+                                                                lte_send_packet (m, 2);
                                                                 return Aok;
                                                                 }
 
@@ -2246,8 +2592,11 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                         pIpV4ControlHashObjectArray[lcore_id][objCount]->dataTeid       = pSessionIdObj->userTeid;
                                                         pIpV4ControlHashObjectArray[lcore_id][objCount]->addDeleteFlag  = DELETE_GTPV1_SESSION_TEARDOWN;
 							//remember the sessionid so that the updated hash entry has the old session id.
-							sessionIdOfUpdateRequest					= pSessionIdObj->sessionId;
-                                                        
+							sessionIdOfUpdateRequest					= sessionIdControlHashTableIPV4[ret].sessionId;
+                                                        lteAppendage.gtpSessionId 					= sessionIdControlHashTableIPV4[ret].sessionId;
+ 							printf ("sks:segregate:requests received sessId= 0x%x%x\n", *(((int*)(&(lteAppendage.gtpSessionId)))+1), lteAppendage.gtpSessionId);
+
+
 							printf ("sks: enqueueing update msg objCount=%d\n", objCount);
 
                                                         ret = rte_ring_mp_enqueue (pControlRing, (void *)pIpV4ControlHashObjectArray[lcore_id][objCount]);
@@ -2257,10 +2606,11 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                                 return Aok;
                                                                 }
                                                         printf ("sks:ring count %d\n", rte_ring_count (pControlRing));
-                                                        lteAppendage.gtpSessionId = sessionIdControlHashTableIPV4[ret].sessionId;
                                                         rte_memcpy(pLteAppendage, &lteAppendage,sizeof(struct LteInfoAppend) );
                                                         //TODO -All done transmit it out right here if possible, since i/f number is avail (pSessionIdObj->intf)
                                                         gtpStats.gtpV1IpV4CtrlPkt++;
+							lte_send_packet (m, 2);
+							return Aok;
                                                         }
  
 						case GTP_PDP_CONTEXT_REQUEST: //intentional fall-thru
@@ -2268,13 +2618,14 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
 						key.xmm[1] = _mm_and_si128(data1, ipV4HashMask0);
 						printf ("sks: got context create request/response msg\n");
 	                                        //...Create a new hash entry
+                                             	pGtpParser = (unsigned char * ) ( (unsigned char *)pGtpHeader  + sizeof(struct GtpV1Header));
                		                        if ( rte_cpu_to_be_32(key.flagsMsgTypeAndLen) & GTP_SEQ_NUMBER_PRESENT )
                                                 //...advance pGtpHeader pointer towards the control and data teids
-                                                       	pGtpParser = (unsigned char * ) ( (unsigned char *)pGtpHeader  + sizeof(struct GtpV1Header) + sizeof (uint16_t));
+                                                       	pGtpParser = (unsigned char * ) ( (unsigned char *)pGtpParser  +  sizeof (uint16_t));
 
                                        	 	//printf ("sks:ctrl plane pkt - recognized pdp request 0x%x \n", (int)(*pGtpParser) );
                                                	if ( rte_cpu_to_be_32(key.flagsMsgTypeAndLen) & GTP_NPDU_PRESENT )
-                                                       	pGtpParser      = (unsigned char *) ((unsigned char *)pGtpHeader + sizeof (uint8_t));
+                                                       	pGtpParser      = (unsigned char *) ((unsigned char *)pGtpParser + sizeof (uint8_t));
 
                                                	/*printf ("*****hex dump****\n");
                                               	while (octets < 32)
@@ -2375,9 +2726,46 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                             	printf ("sks: data I teid =0x%x, control teid=0x%x\n", dataTeid,controlTeid);
                                              	printf ("sks: sGsnIpv4ControlAddr =0x%x, sGsnIpV4UserAddr=0x%x\n", sGsnIpV4ControlAddr, sGsnIpV4UserAddr);
 
-                                            	//Check for duplicate
                                             	union ipv4_3tuple_host dupKey;
                                               	bzero (&dupKey, sizeof(dupKey));
+						if ((rte_cpu_to_be_32(key.flagsMsgTypeAndLen) & 0x00FF0000 )== GTP_PDP_CONTEXT_RESPONSE)
+							{
+							//...Tie the pdp response and request together with the same sessioId
+							dupKey.ip_dst = rte_cpu_to_be_32(key.ip_dst);
+							dupKey.teid = rte_cpu_to_be_32(key.teid);
+                                                	ret = rte_hash_lookup(pSessionIdV4ControlHashTable, (const void *)&dupKey);
+							if (ret > 0)
+								{
+								printf ("sks: successfully tied together the sessionIds\n");
+								//...pdp create request entry found, get the sessionId 
+								createReqSessionId = sessionIdControlHashTableIPV4[ret].sessionId; 
+								}
+							else
+								{
+								//...received create response earlier than create request, kick off timer and wait
+                                                        	if (repeatCount == 0 )
+                                                                	{
+                                                                	printf ("sks:init timer case 6...\n");
+                                                                	struct rte_timer * pUserPlaneTimer;
+                                                                	pUserPlaneTimer = (struct rte_timer *) rte_malloc ("userplane timer",sizeof (struct rte_timer),0);
+                                                                	int resetReturn = 0;
+                                                                	rte_timer_init (pUserPlaneTimer);
+                                                                	printf ("sks: timer reset...\n");
+                                                                	lcore_id = rte_lcore_id ();
+                                                                	resetReturn = rte_timer_reset (pUserPlaneTimer,RETRY_TIMEOUT,SINGLE,lcore_id,pktRetryTimerCb,(void *)m);
+                                                                	printf ("sks: returning nok resetReturn=%d...\n", resetReturn);
+                                                                	return Nok;
+                                                                	}
+                                                        	if (repeatCount == 1)
+                                                                	{
+									//orphan pkt, update stat and return
+									printf ("sks: not able to tie together the sessionIds, discarding...\n");
+									gtpStats.gtpV1CtrlPktDiscards++;
+									return Aok;
+									}
+								}
+							}
+
                                               	dupKey.ip_dst = sGsnIpV4ControlAddr;
                                               	dupKey.teid   = controlTeid;
                                            	ret = rte_hash_lookup(pSessionIdV4ControlHashTable, (const void *)&dupKey);
@@ -2385,12 +2773,13 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                         	if (ret > 0)
                                                      	{
                                                    	//it is a duplicate, append sessionId and tx out
-                                                       	pSessionIdObj = &sessionIdControlHashTableIPV4[ret];
-                                                   	lteAppendage.gtpSessionId = pSessionIdObj->sessionId;
+                                                   	lteAppendage.gtpSessionId = sessionIdControlHashTableIPV4[ret].sessionId;
                                                 	printf ("detected duplicate pdp request, ready to send out pkt...\n");
                                                       	rte_memcpy(pLteAppendage, &lteAppendage,sizeof(struct LteInfoAppend) );
                                                       	//TODO - All done, transmit it out right here if possible, since i/f number is avail (pSessionIdObj->intf)
                                                       	gtpStats.gtpV1IpV4CtrlPkt++;
+							lte_send_packet (m, 2);
+							return Aok;
                                                      	}
                                                	else
                                                 	{
@@ -2445,12 +2834,24 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
 
                                                       	pIpV4ControlHashObjectArray[lcore_id][objCount]->controlTeid    = controlTeid;
                                                      	pIpV4ControlHashObjectArray[lcore_id][objCount]->dataTeid       = dataTeid;
-                                                	globalSessionId = ((globalSessionId & 0x0000ffffffffffff)|(((uint64_t)lcore_id) << 48));
-                                                       	pIpV4ControlHashObjectArray[lcore_id][objCount]->sessionId      = globalSessionId;
+
+							if (createReqSessionId != 0 )
+								{
+							        pIpV4ControlHashObjectArray[lcore_id][objCount]->sessionId      = createReqSessionId;
+								lteAppendage.gtpSessionId = createReqSessionId;
+								createReqSessionId = 0;
+								}
+							else
+								{	
+ 								printf ("sks: generating globalSessionId =0x%x\n", globalSessionId);
+                                                       		pIpV4ControlHashObjectArray[lcore_id][objCount]->sessionId      = globalSessionId++;
+								lteAppendage.gtpSessionId = pIpV4ControlHashObjectArray[lcore_id][objCount]->sessionId;
+								}
 
 							if ((((rte_cpu_to_be_32(key.flagsMsgTypeAndLen) & 0x00FF0000)== GTP_PDP_UPDATE_REQUEST))||((rte_cpu_to_be_32(key.flagsMsgTypeAndLen) & 0x00FF0000)== GTP_PDP_UPDATE_RESPONSE))
 							{
 							pIpV4ControlHashObjectArray[lcore_id][objCount]->sessionId      = sessionIdOfUpdateRequest;
+							lteAppendage.gtpSessionId					= sessionIdOfUpdateRequest;
 							}
                                                        	pIpV4ControlHashObjectArray[lcore_id][objCount]->addDeleteFlag  = ADD_GTPV1_SESSION;
 									
@@ -2463,23 +2864,23 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                             	union ipv4_3tuple_host secKey;
                                                               	bzero (&secKey, sizeof(secKey));
                                                              	secKey.ip_dst = sGsnIpV4ControlAddr;
-                                                              	secKey.teid   = key.teid;
+                                                              	secKey.teid   = rte_cpu_to_be_32(key.teid);
                                                                	ret = rte_hash_lookup(pSessionIdV4ControlHashTable, (const void *)&secKey);
                                                                	if (ret > 0 )
                                                                    	{
                                                                   	//...session exists, extract sessionId
-                                                                       	pSessionIdObj = &sessionIdControlHashTableIPV4[ret];
-                                                                      	pIpV4ControlHashObjectArray[lcore_id][objCount]->sessionId = pSessionIdObj->sessionId;
+                                                                      	pIpV4ControlHashObjectArray[lcore_id][objCount]->sessionId = sessionIdControlHashTableIPV4[ret].sessionId;
                                                                     	}
                                                               	}
 
                                                      	ret = rte_ring_mp_enqueue (pControlRing, (void *)pIpV4ControlHashObjectArray[lcore_id][objCount]);
                                                       	if (ret != 0 )
                                                           	printf ("error in enqueuing to sessionIdRing\n");
-                                                      	lteAppendage.gtpSessionId = globalSessionId++;
                                                        	rte_memcpy(pLteAppendage, &lteAppendage,sizeof(struct LteInfoAppend) );
                                                        	//TODO -All done transmit it out right here if possible, since i/f number is avail (pSessionIdObj->intf)
                                                        	gtpStats.gtpV1IpV4CtrlPkt++;
+							lte_send_packet (m, 2);
+							return Aok;
                                                       	}
 						break;  //ctxt req/resp case
 						}
@@ -2491,6 +2892,97 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
 
                                         switch ((rte_cpu_to_be_32(key.flagsMsgTypeAndLen) & 0x00FF0000 ))
                                                 {
+                                                case GTPV2_TYPE_REL_ACC_BEARER_REQ   : //intentional fall-thru
+                                                case GTPV2_TYPE_REL_ACC_BEARER_RSP   :
+                                                case GTPV2_TYPE_DEL_SESSION_REQ      :
+                                                case GTPV2_TYPE_DEL_SESSION_RSP      :
+                                                bzero (&newKey, sizeof(newKey));
+                                                newKey.ip_dst = rte_cpu_to_be_32(key.ip_dst);
+
+                                                if (rte_cpu_to_be_32(key.flagsMsgTypeAndLen) & GTPV2_TEID_PRESENT)
+                                                        {
+                                                        //printf ("sks: gtpv2 bearer TEID is present\n");
+                                                        pGtpV2Header = (struct GtpV2Header *)((unsigned char *)ipv4_hdr + sizeof(struct ipv4_hdr) + sizeof (struct udp_hdr) );
+                                                        pGtpParser = (unsigned char * ) ( (unsigned char *)pGtpV2Header  + sizeof(struct GtpV2Header) );
+                                                        newKey.teid = rte_cpu_to_be_32(((struct GtpV2Header *)pGtpV2Header)->teid);
+                                                        }
+                                                else
+                                                        {
+                                                        pGtpV2Header = (struct GtpV2Header_noTeid *)((unsigned char *)ipv4_hdr + sizeof(struct ipv4_hdr) + sizeof (struct udp_hdr) );
+                                                        pGtpParser = (unsigned char * ) ( (unsigned char *)pGtpV2Header  + sizeof(struct GtpV2Header_noTeid) );
+                                                        printf ("sks: need to increment a stat, exiting processing this pkt since no teid in hdr and is not a create mgs\n");
+                                                        //TODO: tx it out
+                                                        lte_send_packet (m, 2);
+                                                        return Aok;
+                                                        }
+                                                ret = rte_hash_lookup(pSessionIdV4GtpV2ControlHashTable,(const void *)&newKey);
+
+                                                if (ret <= 0 )
+                                                        {
+                                                printf ("error looking up control \n");
+                                                        }
+                                                if (ret > 0)
+                                                        {
+                                                        //create  a new entry in hash table
+                                                        //cleanup hash object array first
+                                                        lcore_id = rte_lcore_id();
+                                                        socketid = rte_lcore_to_socket_id(rte_lcore_id( ) );
+                                                        rte_snprintf(name, sizeof(name), "sessionIdAddV4Control_ring%u_io%u_sId4",
+                                                                     socketid,
+                                                                     lcore_id);
+
+                                                        pControlRing = rte_ring_lookup (name);
+                                                        if (pControlRing == NULL )
+                                                                {
+                                                                printf ("Cannot find ring %s\n", name);
+                                                                return Aok;
+                                                                }
+
+                                                        if (rte_ring_empty (pControlRing))
+                                                                {
+                                                                printf ("setting all ring entries to NULL\n");
+                                                                for (i=0;i<MAX_HASH_OBJECT_PER_REQUEST;i++)
+                                                                        {
+                                                                        //...Can optimize more here TODO
+                                                                        if(pIpV4ControlHashObjectArray[lcore_id][i])
+                                                                             {
+                                                                             rte_free (pIpV4ControlHashObjectArray[lcore_id][i]);
+                                                                             pIpV4ControlHashObjectArray[lcore_id][i] = NULL;
+                                                                             }
+                                                                        }
+                                                                }
+                                                        //Add a hash entry for control DOWN TEID
+                                                        while (pIpV4ControlHashObjectArray[lcore_id][objCount] != NULL )
+                                                                objCount++;
+                                                        if (objCount > MAX_HASH_OBJECT_PER_REQUEST )
+                                                                {
+                                                                printf ("FATAL: dropping pdp request msg\n");
+                                                                return Aok;
+                                                                }
+                                                        pIpV4ControlHashObjectArray[lcore_id][objCount] = (struct sessionIdIpV4HashObject *) rte_malloc ("hash object array",sizeof(struct sessionIdIpV4HashObject),0);
+                                                        //...downlink ip and control plane teid.
+                                                        pIpV4ControlHashObjectArray[lcore_id][objCount]->ipUser  = 0x0;
+                                                        pIpV4ControlHashObjectArray[lcore_id][objCount]->ipControl = newKey.ip_dst;
+
+                                                        pIpV4ControlHashObjectArray[lcore_id][objCount]->controlTeid  =  newKey.teid;
+                                                        pIpV4ControlHashObjectArray[lcore_id][objCount]->addDeleteFlag = RELEASE_BEARER_GTPV2_SESSION ;
+                                                        printf ("sks:ret =%d ENQUEUING up teid=x0x%x\n", ret, sessionIdControlHashTableIPV4GTPV2[ret].controlTeid);
+							
+                                                        ret = rte_ring_mp_enqueue (pControlRing, (void *)pIpV4ControlHashObjectArray[lcore_id][objCount]);
+							//calculateTimeStamp (&currentTime);
+                                                        //printf ("sks:enque done ring %s, ring count=%u time=0x%x.0x%x\n", pControlRing->name, rte_ring_count (pControlRing),currentTime.tv_sec, currentTime.tv_usec);
+                                                        if (ret != 0 )
+                                                               printf ("error in enqueuing to sessionIdRing\n");
+                                                        lteAppendage.gtpSessionId = pIpV4ControlHashObjectArray[lcore_id][objCount]->sessionId ;
+                                                        rte_memcpy(pLteAppendage, &lteAppendage,sizeof(struct LteInfoAppend) );
+                                                        //TODO -All done transmit it out right here if possible, since i/f number is avail
+                                                        //a(pSessionIdObj->intf)
+                                                        gtpStats.gtpV2IpV4CtrlPkt++;
+							lte_send_packet (m, 2);
+                                                        return Aok;
+                                                        }
+                                                        break;
+
                                                 case GTPV2_CREATE_BEARER_REQUEST     : //...intentional fall-thru create bearer req/resp AND modify bearer req/resp
                                                 case GTPV2_CREATE_BEARER_RESPONSE    :
                                                 case GTPV2_MODIFY_BEARER_REQUEST     :
@@ -2503,8 +2995,8 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                         printf ("sks: gtpv2 TEID is present\n");
                                                         pGtpV2Header = (struct GtpV2Header *)((unsigned char *)ipv4_hdr + sizeof(struct ipv4_hdr) + sizeof (struct udp_hdr) );
                                                         pGtpParser = (unsigned char * ) ( (unsigned char *)pGtpV2Header  + sizeof(struct GtpV2Header) );
-                                                        newKey.teid = ((struct GtpV2Header *)pGtpV2Header)->teid;
-							printf ("sks: came here\n");
+                                                        newKey.teid = rte_cpu_to_be_32(((struct GtpV2Header *)pGtpV2Header)->teid);
+							//printf ("sks: came here\n");
                                                         }
                                                 else
                                                         {
@@ -2514,7 +3006,7 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                         return Aok;
                                                         }
 						
-						printf ("sks: lookup up hash\n");
+						printf ("sks: lookup up ipv4 gtpv2 control hash ip=0x%x, teid=0x%x\n", newKey.ip_dst, newKey.teid);
                                                 ret = rte_hash_lookup(pSessionIdV4GtpV2ControlHashTable,(const void *)&newKey);
 						printf ("sks: gtpv2 v4 hash returned 0x%x\n", ret);
                                                 if (ret > 0 )
@@ -2523,7 +3015,7 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                         while ((octets < (int)(rte_cpu_to_be_32(key.flagsMsgTypeAndLen) & 0x0000FFFF)) )
                                                                 {
                                                                 gtpType = (int)(*pGtpParser);
-                                                                printf ("sks: gtpV2type=0x%x\n", gtpType);
+                                                                //printf ("sks: gtpV2type=0x%x\n", gtpType);
                                                                 if (gtpType ==GTPV2_TYPE_BEARER_CONTEXT)
                                                                         {
                                                                         pGtpParser += sizeof(uint8_t);
@@ -2550,7 +3042,7 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                                                         //...4th octet is for ipv4/v6
                                                                                         //...have to do this chk irrespective of what the ethernet header for this pkt says
                                                                                         //...we might have an ipv4 or an ipv6 fteid in the bc for modify/create bearer msgs
-                                                                                        if ( *pGtpParser == 0x40 )
+                                                                                        if ( *pGtpParser && 0x40 )
                                                                                                 {
                                                                                                 //...ipv6 addr
                                                                                                 pGtpParser += sizeof(uint8_t);
@@ -2625,15 +3117,21 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                                                                 pIpV4ControlHashObjectArray[lcore_id][objCount]->addDeleteFlag = ADD_BEARER_GTPV2_SESSION ;
 
                                                                                                 ret = rte_ring_mp_enqueue (pControlRing, (void *)pIpV4ControlHashObjectArray[lcore_id][objCount]);
+
+
+												//calculateTimeStamp (&currentTime);
+                                                        					//printf ("sks:enque done ring %s, ring count=%u time=0x%x.0x%x\n", pControlRing->name, rte_ring_count (pControlRing),currentTime.tv_sec, currentTime.tv_usec);
+
                                                                                                 if (ret != 0 )
                                                                                                         printf ("error in enqueuing to sessionIdRing\n");
                                                                                                 lteAppendage.gtpSessionId = pIpV4ControlHashObjectArray[lcore_id][objCount]->sessionId ;
                                                                                                 rte_memcpy(pLteAppendage, &lteAppendage,sizeof(struct LteInfoAppend) );
                                                                                                 //TODO -All done transmit it out right here if possible, since i/f number is avail (pSessionIdObj->intf)
-                                                                                                gtpStats.gtpV1IpV4CtrlPkt++; 
+                                                                                                lte_send_packet (m,2);
+                                                                                                gtpStats.gtpV2IpV4CtrlPkt++; 
 												return Aok;
                                                                                                 }
-                                                                                        if ( *pGtpParser == 0x80 )
+                                                                                        if ( *pGtpParser && 0x80 )
                                                                                                 {
                                                                                                 //...ipv4 addr
                                                                                                 pGtpParser += sizeof(uint8_t);
@@ -2699,12 +3197,18 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                                                                 pIpV4ControlHashObjectArray[lcore_id][objCount]->addDeleteFlag = ADD_BEARER_GTPV2_SESSION ;
 
                                                                                                 ret = rte_ring_mp_enqueue (pControlRing, (void *)pIpV4ControlHashObjectArray[lcore_id][objCount]);
+
+
+												//calculateTimeStamp (&currentTime);
+                                                        					//printf ("sks:enque done ring %s, ring count=%u time=0x%x.0x%x\n", pControlRing->name, rte_ring_count (pControlRing),currentTime.tv_sec, currentTime.tv_usec);
+
                                                                                                 if (ret != 0 )
                                                                                                         printf ("error in enqueuing to sessionIdRing\n");
                                                                                                 lteAppendage.gtpSessionId = pIpV4ControlHashObjectArray[lcore_id][objCount]->sessionId ;
                                                                                                 rte_memcpy(pLteAppendage, &lteAppendage,sizeof(struct LteInfoAppend) );
                                                                                                 //TODO -All done transmit it out right here if possible, since i/f number is avail (pSessionIdObj->intf)
-                                                                                                gtpStats.gtpV1IpV4CtrlPkt++;
+                                                                                                lte_send_packet(m,2);
+                                                                                                gtpStats.gtpV2IpV4CtrlPkt++;
                                                                                                 return Aok;
 
                                                                                                 }
@@ -2739,7 +3243,8 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                         //...too early, start a timer and wait.
                                                         if (repeatCount == 0 )
                                                                 {
-                                                                printf ("sks:init timer case 1...\n");
+								calculateTimeStamp (&currentTime);
+                                                                printf ("sks:time=0x%x.0x%x init timer case 1...\n", currentTime.tv_sec, currentTime.tv_usec);
                                                                 struct rte_timer * pUserPlaneTimer;
                                                                 pUserPlaneTimer = (struct rte_timer *) rte_malloc ("userplane timer",sizeof (struct rte_timer),0);
                                                                 int resetReturn = 0;
@@ -2752,7 +3257,10 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                                 }
                                                         if (repeatCount == 1)
                                                                 {
+								calculateTimeStamp (&currentTime);
                                                                 //...orphan pkt, update stats and discard.
+                                                                printf ("sks: hash entry not there, discarding bearer msg time=0x%x.0x%x\n", currentTime.tv_sec, currentTime.tv_usec);
+								gtpStats.gtpV2IpV4ControlPktDiscards++;
                                                                 return Aok;
                                                                 }
                                                         }
@@ -2760,7 +3268,7 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                 break;
                                                 case GTPV2_CREATE_SESSION_RESPONSE   :  //...intentional fall-thru
                                                 case GTPV2_CREATE_SESSION_REQUEST    :
-                                                printf ("sks: got gtpv2 create request\n");
+                                                printf ("sks: got ipv4 gtpv2 create request\n");
                                                 if (rte_cpu_to_be_32(key.flagsMsgTypeAndLen) & GTPV2_TEID_PRESENT)
                                                         {
                                                         printf ("sks: gtpv2 create req/resp TEID is present\n");
@@ -2774,11 +3282,12 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
 
                                                         }
                                                 octets = 1;
-                                                printf ("sks: gtpv2 pkt len=0x%x\n", (rte_cpu_to_be_32(key.flagsMsgTypeAndLen) & 0x0000FFFF));
-                                                while ((octets < (int)(rte_cpu_to_be_32(key.flagsMsgTypeAndLen) & 0x0000FFFF))&& (sGsnIpV4ControlAddr = 0))
+						sGsnIpV4ControlAddr=0x0;
+                                                printf ("sks: ipv4 gtpv2 pkt len=0x%x\n", (rte_cpu_to_be_32(key.flagsMsgTypeAndLen) & 0x0000FFFF));
+                                                while ((octets < (int)(rte_cpu_to_be_32(key.flagsMsgTypeAndLen) & 0x0000FFFF))&& (sGsnIpV4ControlAddr == 0))
                                                         {
                                                         gtpType = (int)(*pGtpParser);
-                                                        printf ("sks: gtpV2type=0x%x\n", gtpType);
+                                                        //printf ("sks: gtpV2type=0x%x\n", gtpType);
                                                         if (gtpType == GTPV2_TYPE_FTEID)
                                                                 {
                                                                 pGtpParser += sizeof (uint8_t);
@@ -2824,6 +3333,8 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                         rte_memcpy(pLteAppendage, &lteAppendage,sizeof(struct LteInfoAppend) );
                                                         //TODO - All done, transmit it out right here if possible, since i/f number is avail (pSessionIdObj->intf)
                                                         gtpStats.gtpV2IpV4CtrlPkt++;
+							lte_send_packet (m, 2);
+							return Aok;
                                                         }
                                                 else
                                                         {
@@ -2831,7 +3342,7 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                         //cleanup hash object array first
                                                         lcore_id = rte_lcore_id();
                                                         socketid = rte_lcore_to_socket_id(rte_lcore_id( ) );
-                                                        rte_snprintf(name, sizeof(name), "sessionIdAddV6Control_ring%u_io%u_sId4",
+                                                        rte_snprintf(name, sizeof(name), "sessionIdAddV4Control_ring%u_io%u_sId4",
                                                                         socketid,
                                                                         lcore_id);
 
@@ -2883,9 +3394,39 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                         dataTeid                                                        = 0;
                                                         if ((rte_cpu_to_be_32(key.flagsMsgTypeAndLen) & 0x00FF0000) == GTPV2_CREATE_SESSION_RESPONSE )
                                                                 {
+                                                       		dupKey.ip_dst = rte_cpu_to_be_32(key.ip_dst);
+                                                        	dupKey.teid = rte_cpu_to_be_32(key.teid);
+								printf ("sks: ip=0x%x, teid=0x%x\n", dupKey.ip_dst,dupKey.teid);
+                                                        	ret = rte_hash_lookup(pSessionIdV4GtpV2ControlHashTable, (const void *)&dupKey);
+                                                        	if (ret > 0)
+                                                                	{
+									createReqSessionId = sessionIdControlHashTableIPV4GTPV2[ret].sessionId;
+									}
+                                                        	else
+                                                                	{
+                                                                	if (repeatCount == 0 )
+                                                                        	{
+                                                                        	printf ("sks:init timer case 6...\n");
+                                                                        	struct rte_timer * pUserPlaneTimer;
+                                                                        	pUserPlaneTimer = (struct rte_timer *) rte_malloc ("userplane timer",sizeof (struct rte_timer),0);
+                                                                        	int resetReturn = 0;
+                                                                        	rte_timer_init (pUserPlaneTimer);
+                                                                        	printf ("sks: timer reset...\n");
+                                                                        	lcore_id = rte_lcore_id ();
+                                                                        	resetReturn = rte_timer_reset (pUserPlaneTimer,RETRY_TIMEOUT,SINGLE,lcore_id,pktRetryTimerCb,(void *)m);
+                                                                        	printf ("sks: returning nok resetReturn=%d...\n", resetReturn);
+                                                                        	return Nok;
+                                                                        	}
+									
+                                                                	if (repeatCount == 1)
+                                                                        	{
+                                                                        	gtpStats.gtpV2CtrlPktDiscards++;
+                                                                        	return Aok;
+										}
+									}	
                                                                 //...in gtpv2 only the create session response msg has the userplane teid in the bearer create msg
                                                                 //...parse this from where we left off earlier.
-                                                                while (((octets < (int)(rte_cpu_to_be_32(keyV6.flagsMsgTypeAndLen)))) && (dataTeid == 0))
+                                                                while (((octets < (int)(rte_cpu_to_be_32(key.flagsMsgTypeAndLen)))) && (dataTeid == 0))
                                                                         {
                                                                         gtpType = (int)(*pGtpParser);
                                                                         //printf ("sks: create session response gtpV2type=0x%x\n", gtpType);
@@ -2942,10 +3483,19 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
 
                                                                         }
                                                                 }
-                                                        printf ("sks: gtpV2, user teid=0x%x\n", dataTeid);
+                                                        //printf ("sks: gtpV2, user teid=0x%x\n", dataTeid);
                                                         pIpV4ControlHashObjectArray[lcore_id][objCount]->dataTeid       = dataTeid;
-                                                        globalSessionId = ((globalSessionId & 0x0000ffffffffffff)|(((uint64_t)lcore_id) << 48));
-                                                        pIpV4ControlHashObjectArray[lcore_id][objCount]->sessionId      = globalSessionId;
+                                                        if (createReqSessionId != 0 )
+                                                                {
+                                                                pIpV4ControlHashObjectArray[lcore_id][objCount]->sessionId      = createReqSessionId;
+                                                                createReqSessionId = 0;
+                                                                }
+							else
+								{
+ 								printf ("sks: generating globalSessionId =0x%x\n", globalSessionId);
+                                                        	pIpV4ControlHashObjectArray[lcore_id][objCount]->sessionId      = globalSessionId++;
+								}
+
                                                         pIpV4ControlHashObjectArray[lcore_id][objCount]->addDeleteFlag  = ADD_GTPV2_SESSION;
 
                                                         if ((key.teid != 0) && (((rte_cpu_to_be_32(key.flagsMsgTypeAndLen) & 0x00FF0000)== GTPV2_CREATE_SESSION_REQUEST)))
@@ -2954,7 +3504,7 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                                 union ipv4_3tuple_host secKey;
                                                                 bzero (&secKey, sizeof(secKey));
                                                                 secKey.ip_src = sGsnIpV4ControlAddr;
-                                                                secKey.teid      = key.teid;
+                                                                secKey.teid      = rte_cpu_to_be_32(key.teid);
                                                                 ret = rte_hash_lookup(pSessionIdV4GtpV2ControlHashTable, (const void *)&secKey);
                                                                 if (ret > 0 )
                                                                         {
@@ -2965,12 +3515,19 @@ static inline int segregateControlAndUserTraffic(struct rte_mbuf *m, int repeatC
                                                                 }
 
                                                         ret = rte_ring_mp_enqueue (pControlRing, (void *)pIpV4ControlHashObjectArray[lcore_id][objCount]);
+
+
+							//calculateTimeStamp (&currentTime);
+                                       			//printf ("sks:enque done ring %s, ring count=%u time=0x%x.0x%x\n", pControlRing->name, rte_ring_count (pControlRing),currentTime.tv_sec, currentTime.tv_usec);
+
                                                         if (ret != 0 )
                                                                 printf ("error in enqueuing to sessionIdRing\n");
-                                                        lteAppendage.gtpSessionId = globalSessionId++;
+                                                        lteAppendage.gtpSessionId = pIpV4ControlHashObjectArray[lcore_id][objCount]->sessionId;
                                                         rte_memcpy(pLteAppendage, &lteAppendage,sizeof(struct LteInfoAppend) );
                                                         //TODO -All done transmit it out right here if possible, since i/f number is avail (pSessionIdObj->intf)
-                                                        gtpStats.gtpV1IpV4CtrlPkt++;
+                                                        gtpStats.gtpV2IpV4CtrlPkt++;
+							lte_send_packet (m, 2);
+							return Aok;
                                                         }
                                                 break;
                                                 }
@@ -3002,13 +3559,19 @@ l2fwd_main_loop(void)
 	prev_tsc = 0;
 	prev_tsc_timer = 0;
 	timer_tsc = 0;
-	globalSessionId = 0;
+	globalSessionId = 0x01;
 
         /* init RTE timer library */
         rte_timer_subsystem_init();
 
 	lcore_id = rte_lcore_id();
 	qconf = &lcore_queue_conf[lcore_id];
+
+	//...Initialize nDPI module
+ 	setupDetection (lcore_id);
+
+	//...setup locks
+	
 
 	if (qconf->n_rx_port == 0) {
 		RTE_LOG(INFO, L2FWD, "lcore %u has nothing to do\n", lcore_id);
@@ -3027,14 +3590,21 @@ l2fwd_main_loop(void)
 
 	//...clear out gtp statistics
 	//
-        gtpStats.gtpV1IpV4CtrlPkt = 0x0;
-        gtpStats.gtpV1IpV4UserPkt = 0x0;
-        gtpStats.gtpV2IpV4CtrlPkt = 0x0;
-        gtpStats.gtpV2IpV4UserPkt = 0x0;
-        gtpStats.gtpV1IpV6CtrlPkt = 0x0;
-        gtpStats.gtpV1IpV6UserPkt = 0x0;
-        gtpStats.gtpV2IpV6CtrlPkt = 0x0;
-        gtpStats.gtpV2IpV6UserPkt = 0x0;
+        gtpStats.gtpV1IpV4CtrlPkt		= 0x0;
+        gtpStats.gtpV1V2IpV4UserPkt		= 0x0;
+        gtpStats.gtpV2IpV4CtrlPkt		= 0x0;
+        gtpStats.gtpV1IpV6CtrlPkt		= 0x0;
+        gtpStats.gtpV1V2IpV6UserPkt		= 0x0;
+        gtpStats.gtpV1V2IpV6UserPktFragment	= 0x0;
+        gtpStats.gtpV1V2IpV4UserPktFragmentDiscards	= 0x0;
+        gtpStats.gtpV1V2IpV6UserPktFragmentDiscards	= 0x0;
+        gtpStats.gtpV2IpV6CtrlPkt		= 0x0;
+        gtpStats.gtpV1V2IpV6UserPktDiscards	= 0x0;
+        gtpStats.gtpV1V2IpV4UserPktDiscards	= 0x0;
+        gtpStats.gtpV1IpV6ControlPktDiscards	= 0x0;
+        gtpStats.gtpV2IpV6ControlPktDiscards	= 0x0;
+        gtpStats.gtpV1IpV4ControlPktDiscards	= 0x0;
+        gtpStats.gtpV2IpV4ControlPktDiscards	= 0x0;
 
 
 	while (1) {
@@ -3115,11 +3685,30 @@ l2fwd_main_loop(void)
 static void pktRetryTimerCb (__attribute__((unused)) struct rte_timer *tim,
                             __attribute__((unused)) void *pkt)
         {
-	printf ("SKS:  timer cb  called\n");
+	//printf ("SKS:  timer cb  called\n");
         segregateControlAndUserTraffic (pkt, 1);
 	rte_pktmbuf_free ((struct rte_mbuf *)pkt);
 	rte_free (tim);
         }
+
+static inline uint32_t
+sessionId_hash_crc(const void *data, __rte_unused uint32_t data_len,
+        uint32_t init_val)
+{
+        const union sessionId_2tuple_host *k1;
+
+        k1 = data;
+
+#ifdef RTE_MACHINE_CPUFLAG_SSE4_2
+        init_val = rte_hash_crc_4byte(k1->sessionId, init_val);
+        init_val = rte_hash_crc_4byte(k1->msgType, init_val);
+#else /* RTE_MACHINE_CPUFLAG_SSE4_2 */
+        //init_val = rte_jhash_1word(k1->ip_src, init_val);
+        init_val = rte_jhash_1word(k1->sessionId, init_val);
+        init_val = rte_jhash_1word(k1->msgType, init_val);
+#endif /* RTE_MACHINE_CPUFLAG_SSE4_2 */
+        return (init_val);
+}
 
 static inline uint32_t
 ipv4_hash_crc(const void *data, __rte_unused uint32_t data_len,
@@ -3139,6 +3728,24 @@ ipv4_hash_crc(const void *data, __rte_unused uint32_t data_len,
         init_val = rte_jhash_1word(k1->teid, init_val);
 #endif /* RTE_MACHINE_CPUFLAG_SSE4_2 */
         return (init_val);
+}
+
+static inline uint32_t
+ipv4_hash_fragId(const void *data, __rte_unused uint32_t data_len, uint32_t init_val)
+{
+	
+	const union ipv4_2tuple_host *k1;
+	k1 = data;
+#ifdef RTE_MACHINE_CPUFLAG_SSE4_2
+        init_val = rte_hash_crc_4byte(k1->fragId, init_val);
+        init_val = rte_hash_crc_4byte(k1->ip_addr, init_val);
+#else /* RTE_MACHINE_CPUFLAG_SSE4_2 */
+        init_val = rte_jhash_1word(k1->fragId, init_val);
+        init_val = rte_jhash_1word(k1->ip_addr, init_val);
+#endif /* RTE_MACHINE_CPUFLAG_SSE4_2 */
+        return (init_val);
+
+
 }
 
 static inline uint32_t
@@ -3162,9 +3769,9 @@ ipv6_hash_crc(const void *data, __rte_unused uint32_t data_len, uint32_t init_va
         //ip_src2 = (const uint32_t *)(k->ip_src+8);
         //ip_src3 = (const uint32_t *)(k->ip_src+12);
         ip_dst0 = (const uint32_t *) k->ip_dst;
-        ip_dst1 = (const uint32_t *)(k->ip_dst+4);
-        ip_dst2 = (const uint32_t *)(k->ip_dst+8);
-        ip_dst3 = (const uint32_t *)(k->ip_dst+12);
+        ip_dst1 = (const uint32_t *)(k->ip_dst+1);
+        ip_dst2 = (const uint32_t *)(k->ip_dst+2);
+        ip_dst3 = (const uint32_t *)(k->ip_dst+3);
         init_val = rte_hash_crc_4byte(t, init_val);
         //init_val = rte_hash_crc_4byte(*ip_src0, init_val);
         //init_val = rte_hash_crc_4byte(*ip_src1, init_val);
@@ -3183,6 +3790,86 @@ ipv6_hash_crc(const void *data, __rte_unused uint32_t data_len, uint32_t init_va
 #endif /* RTE_MACHINE_CPUFLAG_SSE4_2 */
         return (init_val);
 }
+static inline uint32_t
+ipv6_hash_fragId(const void *data, __rte_unused uint32_t data_len, uint32_t init_val)
+{
+        const union ipv6_2tuple_host *k;
+        uint32_t t;
+        const uint32_t *p;
+#ifdef RTE_MACHINE_CPUFLAG_SSE4_2
+//        const uint32_t  *ip_src0, *ip_src1, *ip_src2, *ip_src3;
+        const uint32_t  *ip_dst0, *ip_dst1, *ip_dst2, *ip_dst3;
+#endif /* RTE_MACHINE_CPUFLAG_SSE4_2 */
+
+        k = data;
+        t = 17;//sks - hardcode it for now - it is always going to be udp
+        p = (const uint32_t *)&k->fragId;
+
+#ifdef RTE_MACHINE_CPUFLAG_SSE4_2
+        ip_dst0 = (const uint32_t *) k->ip_addr;
+        ip_dst1 = (const uint32_t *)(k->ip_addr+1);
+        ip_dst2 = (const uint32_t *)(k->ip_addr+2);
+        ip_dst3 = (const uint32_t *)(k->ip_addr+3);
+        init_val = rte_hash_crc_4byte(t, init_val);
+        init_val = rte_hash_crc_4byte(*ip_dst0, init_val);
+        init_val = rte_hash_crc_4byte(*ip_dst1, init_val);
+        init_val = rte_hash_crc_4byte(*ip_dst2, init_val);
+        init_val = rte_hash_crc_4byte(*ip_dst3, init_val);
+        init_val = rte_hash_crc_4byte(*p, init_val);
+#else /* RTE_MACHINE_CPUFLAG_SSE4_2 */
+        init_val = rte_jhash_1word(t, init_val);
+        init_val = rte_jhash(k->ip_addr, sizeof(uint32_t) * IPV6_ADDR_LEN, init_val);
+        init_val = rte_jhash_1word(*p, init_val);
+#endif /* RTE_MACHINE_CPUFLAG_SSE4_2 */
+        return (init_val);
+}
+
+void writeCSVFile ( int );
+
+void writeCSVFile ( int loc )
+        {
+        FILE  *fd;
+        fd = fopen ( "/home/sks/idr.csv", "a+");
+        if (fd == NULL)
+                {
+                printf ("Cannot open file /home/sks/idr.csv\n");
+                return;
+                }
+        printf ("writeCSVFile !!!!\n");
+
+        fprintf ( fd, "%u,%u,%u,%u,%u,%u,%u,%u:%u:%u:%u,%u:%u:%u:%u,%u,%u,%#" PRIx64 ",%u,%s,%u,%s,%u,%u,%u,%s,%u,%u\n",
+        ctrlIdrHashTable[loc].startmSecs,
+        ctrlIdrHashTable[loc].startuSecs,
+        ctrlIdrHashTable[loc].endmSecs,
+        ctrlIdrHashTable[loc].enduSecs,
+        ctrlIdrHashTable[loc].ifType,
+        ctrlIdrHashTable[loc].srcIp,
+        ctrlIdrHashTable[loc].dstIp,
+        ctrlIdrHashTable[loc].srcIpV6[0],
+        ctrlIdrHashTable[loc].srcIpV6[1],
+        ctrlIdrHashTable[loc].srcIpV6[2],
+        ctrlIdrHashTable[loc].srcIpV6[3],
+        ctrlIdrHashTable[loc].dstIpV6[0],
+        ctrlIdrHashTable[loc].dstIpV6[1],
+        ctrlIdrHashTable[loc].dstIpV6[2],
+        ctrlIdrHashTable[loc].dstIpV6[3],
+        ctrlIdrHashTable[loc].srcPort,
+        ctrlIdrHashTable[loc].dstPort,
+        ctrlIdrHashTable[loc].imsi,
+        ctrlIdrHashTable[loc].imeisv,
+        ctrlIdrHashTable[loc].msisdn,
+        ctrlIdrHashTable[loc].pTMSI,
+        ctrlIdrHashTable[loc].apn,
+        ctrlIdrHashTable[loc].uli,
+        ctrlIdrHashTable[loc].rat,
+        ctrlIdrHashTable[loc].gtpVersion,
+        ctrlIdrHashTable[loc].direction,
+        ctrlIdrHashTable[loc].causeCode,
+        ctrlIdrHashTable[loc].timeoutIndicator
+        );
+
+        fclose (fd);
+        }
 
 
 static void
@@ -3191,16 +3878,45 @@ sessionIdHashTableMaint ( void )
 	char name[32];
         struct rte_ring * pControlRing = NULL;
         struct rte_ring * pControlRingV6 = NULL;
+        struct rte_ring * pFragRing = NULL;
+        struct rte_ring * pIdrRing = NULL;
         struct sessionIdIpV4HashObject *pHashObject = NULL;
         struct sessionIdIpV6HashObject *pHashObjectV6 = NULL;
+        struct fragIdHashObject *pFragIdHashObject = NULL;
+        struct idrHashObject *pIdrHashObject = NULL;
         void * pTest[20];
         int ret;
         int lcore_id=0x01;
         union ipv4_3tuple_host  key;
         union ipv6_3tuple_host  keyV6;
+	struct gtpV2IpBearerList	*pBearer = NULL;
+        union ipv4_2tuple_host fragKeyV4;
+        union ipv6_2tuple_host fragKeyV6;
+        union sessionId_2tuple_host sessionIdKey;
+	struct timeval currentTime;
 
 	//...init the globalsessionid and i/f
 	lastInterfaceUsed = 2;
+
+        struct rte_hash_parameters ipv4FragIdHashTblParams = {
+        .name = NULL,
+        .entries = SESSION_HASH_ENTRIES,
+        .bucket_entries = 4,
+        .key_len = sizeof(union ipv4_2tuple_host),
+        .hash_func = ipv4_hash_fragId,
+        .hash_func_init_val = 0,
+        };
+
+        struct rte_hash_parameters ipv6FragIdHashTblParams = {
+        .name = NULL,
+        .entries = SESSION_HASH_ENTRIES,
+        .bucket_entries = 4,
+        .key_len = sizeof(union ipv6_2tuple_host),
+        .hash_func = ipv6_hash_fragId,
+        .hash_func_init_val = 0,
+        };
+
+
     	struct rte_hash_parameters ipV4SessionIdHashParams = {
         .name = NULL,
         .entries = SESSION_HASH_ENTRIES,
@@ -3209,6 +3925,15 @@ sessionIdHashTableMaint ( void )
         .hash_func = ipv4_hash_crc,
         .hash_func_init_val = 0,
     	};
+
+        struct rte_hash_parameters controlIdrHashTblParams = {
+        .name = NULL,
+        .entries = SESSION_HASH_ENTRIES,
+        .bucket_entries = 4,
+        .key_len = sizeof(union sessionId_2tuple_host),
+        .hash_func = sessionId_hash_crc,
+        .hash_func_init_val = 0,
+        };
 	
 	int socketid;
 
@@ -3219,10 +3944,35 @@ sessionIdHashTableMaint ( void )
         .key_len = sizeof(union ipv6_3tuple_host),
         .hash_func = ipv6_hash_crc,
         .hash_func_init_val = 0,
-    };
+    	};
 
     	char s[64];
 	socketid = rte_lcore_to_socket_id(rte_lcore_id() );
+
+	/*create a fragId table*/
+        rte_snprintf(s, sizeof(s), "ipv4FragIdHashTable_%d", socketid);
+        ipv4FragIdHashTblParams.name = s;
+        ipv4FragIdHashTblParams.socket_id = socketid;
+        pIpV4FragIdHashTable = rte_hash_create(&ipv4FragIdHashTblParams);
+        if (pIpV4FragIdHashTable == NULL)
+                {
+                printf (" hash table is NULL !!!, exiting\n");
+                rte_exit(EXIT_FAILURE, "Unable to create the l3fwd hash on "
+                                "socket %d\n", socketid);
+                }
+
+        rte_snprintf(s, sizeof(s), "ipv6FragIdHashTable_%d", socketid);
+        ipv6FragIdHashTblParams.name = s;
+        ipv6FragIdHashTblParams.socket_id = socketid;
+        pIpV6FragIdHashTable = rte_hash_create(&ipv6FragIdHashTblParams);
+        if (pIpV6FragIdHashTable == NULL)
+                {
+                printf (" hash table is NULL !!!, exiting\n");
+                rte_exit(EXIT_FAILURE, "Unable to create the l3fwd hash on "
+                                "socket %d\n", socketid);
+                }
+
+	
 	/* create ipv4 control hash table */
 	rte_snprintf(s, sizeof(s), "ipv4_sessionIdControl_hash_%d", socketid);
 	ipV4SessionIdHashParams.name = s;
@@ -3282,6 +4032,30 @@ sessionIdHashTableMaint ( void )
                                 "socket %d\n", socketid);
                 }
 
+        /* create ipv6 user hash table */
+        rte_snprintf(s, sizeof(s), "ipv6_sessionIdUser_hash_%d", socketid);
+        ipV6SessionIdHashParams.name = s;
+        ipV6SessionIdHashParams.socket_id = socketid;
+        pSessionIdV6UserHashTable = rte_hash_create(&ipV6SessionIdHashParams);
+        if (pSessionIdV6UserHashTable == NULL)
+                {
+                printf (" hash table is NULL !!!, exiting\n");
+                rte_exit(EXIT_FAILURE, "Unable to create %s the l3fwd hash on "
+                                "socket %d\n", s, socketid);
+                }
+	/*create a control IDR table*/
+        rte_snprintf(s, sizeof(s), "ControlIdrHashTable_%d", socketid);
+        controlIdrHashTblParams.name = s;
+        controlIdrHashTblParams.socket_id = socketid;
+        pCtrlIdrHashTable = rte_hash_create(&controlIdrHashTblParams);
+        if (pCtrlIdrHashTable == NULL)
+                {
+                printf (" control idr hash table is NULL !!!, exiting\n");
+                rte_exit(EXIT_FAILURE, "Unable to create the l3fwd hash on "
+                                "socket %d\n", socketid);
+                }
+
+
          bzero ( &key,sizeof(key));
          bzero ( &keyV6,sizeof(keyV6));
 
@@ -3298,37 +4072,189 @@ sessionIdHashTableMaint ( void )
 
          pControlRingV6 = rte_ring_lookup (name);
 
+	if (pControlRingV6 == NULL) { printf ("sks: v6 control RING is NULL!!!!\n");};
+
+         rte_snprintf(name, sizeof(name), "FragId_ring%u_io%u_sId4",
+                    socketid,
+                    lcore_id);
+
+         pFragRing = rte_ring_lookup (name);
+	
+	if (pFragRing == NULL) { printf ("sks: frag RING is NULL!!!!\n");};
+
+        rte_snprintf(name, sizeof(name), "idrControlRing%u_io%u_sId4",
+                                socketid,
+                                lcore_id);
+
+        pIdrRing = rte_ring_lookup (name);
+
+	if (pIdrRing == NULL) { printf ("sks: idr RING is NULL!!!!\n");};
+	int printIndex=0;
+
 	while (1) 
 		{
-
-			if (pControlRing != NULL )
+		if (pIdrRing != NULL )
+			{
+			ret = rte_ring_dequeue (pIdrRing, (void **)pTest);
+			//calculateTimeStamp (&currentTime);
+			if (ret == 0 )
 				{
-				//...ring exists, continue
-				//rte_ring_dump(pControlRing);
-				ret = rte_ring_dequeue ( pControlRing, (void **)pTest);
-				if (ret == 0 )
+				pIdrHashObject = (struct idrHashObject *)pTest[0];
+				//printf ("sks: ...........................pIdrRing dequeue successful ring count %d time 0x%x.0x%x\n", rte_ring_count (pIdrRing));
+				if (pIdrHashObject )
 					{
-					printf ("sks:dequeue successful ring count %d\n", rte_ring_count (pControlRing));
-					pHashObject = (struct sessionIdIpV4HashObject *)pTest[0];
-					printf ("sks:addDeleteFlag = 0x%x\n", (int)(pHashObject->addDeleteFlag));
+					bzero (&sessionIdKey, sizeof (sessionIdKey));	
+					sessionIdKey.sessionId = pIdrHashObject->sessionId;
+					sessionIdKey.msgType   = pIdrHashObject->msgType;
+					//printf ("Maint:sks: key.sid=0x%x, key.mType=0x%x\n",sessionIdKey.sessionId,sessionIdKey.msgType);
 					}
-                        	if (ret != 0 )
-                                	{
-					//...no data on ring, continue...
-                                	continue;
-                                	}
-				if (pHashObject == NULL)
+				ret = rte_hash_add_key (pCtrlIdrHashTable, &sessionIdKey);
+				if (ret>0)
 					{
-					printf ("sks hash object is null\n");
-					continue;
-					}
+					//printf ("Maint:sks: adding idr hash key for sId=0x%x, msgType=0x%x\n", sessionIdKey.sessionId,sessionIdKey.msgType);
+					//...zero out the control idr before populating it
+					if ((pIdrHashObject->origMsgType == GTP_PDP_CONTEXT_REQUEST)||(pIdrHashObject->origMsgType == GTP_PDP_UPDATE_REQUEST)||
+					    (pIdrHashObject->origMsgType == GTP_PDP_DELETE_CONTEXT_REQUEST)||(pIdrHashObject->origMsgType == GTPV2_CREATE_SESSION_REQUEST) ||
+					    (pIdrHashObject->origMsgType == GTPV2_TYPE_REL_ACC_BEARER_REQ)||(pIdrHashObject->origMsgType == GTPV2_TYPE_DEL_SESSION_REQ) ||
+					    (pIdrHashObject->origMsgType == GTPV2_CREATE_BEARER_REQUEST)||(pIdrHashObject->origMsgType == GTPV2_MODIFY_BEARER_REQUEST)) 
+						{
+						//printf ("sks: Maint - storing hash object in hashtable for req msg\n");
+						bzero (&ctrlIdrHashTable[ret],sizeof (struct controlIdr));
+						ctrlIdrHashTable[ret].startmSecs = pIdrHashObject->secs;
+						ctrlIdrHashTable[ret].startuSecs = pIdrHashObject->usecs;
+						ctrlIdrHashTable[ret].srcIp 	 = pIdrHashObject->ipV4SrcAddr;
+						ctrlIdrHashTable[ret].dstIp 	 = pIdrHashObject->ipV4DstAddr;
+						ctrlIdrHashTable[ret].srcIpV6[0] = pIdrHashObject->ipV6SrcAddr[0];
+						ctrlIdrHashTable[ret].srcIpV6[1] = pIdrHashObject->ipV6SrcAddr[1];
+						ctrlIdrHashTable[ret].srcIpV6[2] = pIdrHashObject->ipV6SrcAddr[2];
+						ctrlIdrHashTable[ret].srcIpV6[3] = pIdrHashObject->ipV6SrcAddr[3];
+                                        	ctrlIdrHashTable[ret].dstIpV6[0] = pIdrHashObject->ipV6DstAddr[0];
+                                        	ctrlIdrHashTable[ret].dstIpV6[1] = pIdrHashObject->ipV6DstAddr[1];
+                                        	ctrlIdrHashTable[ret].dstIpV6[2] = pIdrHashObject->ipV6DstAddr[2];
+                                        	ctrlIdrHashTable[ret].dstIpV6[3] = pIdrHashObject->ipV6DstAddr[3];
+						}
+					else
+						{
+						//printf ("sks: Maint - storing hash object in hashtable for resp msg\n");
+                                                ctrlIdrHashTable[ret].endmSecs = pIdrHashObject->secs;
+                                                ctrlIdrHashTable[ret].enduSecs = pIdrHashObject->usecs;
+						}
+
+					if (pIdrHashObject->imsi != 0 )
+                                        	ctrlIdrHashTable[ret].imsi	 = pIdrHashObject->imsi;
+					if (pIdrHashObject->imeisv != 0 )
+                                        	ctrlIdrHashTable[ret].imeisv	 = pIdrHashObject->imeisv;
+					if (pIdrHashObject->msip != 0 )
+                                        	ctrlIdrHashTable[ret].msip	 = pIdrHashObject->msip;
+                                        if (pIdrHashObject->pTMSI != 0 )
+                                                ctrlIdrHashTable[ret].pTMSI      = pIdrHashObject->pTMSI;
+					
+					if (pIdrHashObject->apn[0]!='\0')
+						rte_snprintf (ctrlIdrHashTable[ret].apn,sizeof(pIdrHashObject->apn), "%s", pIdrHashObject->apn);
+					if (pIdrHashObject->msisdn[0]!='\0')
+						rte_snprintf (ctrlIdrHashTable[ret].msisdn,sizeof(pIdrHashObject->msisdn), "%s", pIdrHashObject->msisdn);
+
+                                        if (pIdrHashObject->uli != 0 )
+                                                ctrlIdrHashTable[ret].uli        = pIdrHashObject->uli;
+                                        if (pIdrHashObject->rat != 0 )
+                                                ctrlIdrHashTable[ret].rat        = pIdrHashObject->rat;
+                                        if (pIdrHashObject->gtpVersion != 0 )
+                                                ctrlIdrHashTable[ret].gtpVersion = pIdrHashObject->gtpVersion;
 
 
+                                        }
+				else
+					{
+					printf ( "Unable to create control Idr HashTable entry\n");
+					}
+
+				}
+			else
+				{
+	/*			printIndex++;
+				if ((printIndex %100000000) == 0)
+					{
+					printf ("sks: ctrlIdrHashTable[406168] contents...0x%x,0x%x\n", ctrlIdrHashTable[406168].startmSecs,ctrlIdrHashTable[406168].startuSecs );
+					}*/
+
+				}
+			}
+
+		if (pFragRing != NULL)
+			{
+		        //...ring exists, continue
+                        //rte_ring_dump(pControlRing);
+                        ret = rte_ring_dequeue ( pFragRing, (void **)pTest);
+                        pFragIdHashObject = NULL;
+                        if (ret == 0 )
+                                {
+                                printf ("sks:dequeue successful ring count %d\n", rte_ring_count (pFragRing));
+                                pFragIdHashObject = (struct fragIdHashObject *)pTest[0];
+                                }
+                        if (pFragIdHashObject )
+				{
+			        if (pFragIdHashObject->ipV4DstAddr == 0x0)
+					{
+					//...it is an ipv6 fragment
+					bzero ( &fragKeyV6, sizeof (fragKeyV6));
+					fragKeyV6.fragId = pFragIdHashObject->fragId;
+					fragKeyV6.ip_addr[0] = pFragIdHashObject->ipV6DstAddr[0];
+					fragKeyV6.ip_addr[1] = pFragIdHashObject->ipV6DstAddr[1];
+					fragKeyV6.ip_addr[2] = pFragIdHashObject->ipV6DstAddr[2];
+					fragKeyV6.ip_addr[3] = pFragIdHashObject->ipV6DstAddr[3];
+
+                                        ret = rte_hash_add_key (pIpV6FragIdHashTable, &keyV6);
+					if (ret > 0)
+						{
+						ipV6fragIdHashTable[ret].fragId = fragKeyV6.fragId;
+						ipV6fragIdHashTable[ret].sessionId = pFragIdHashObject->sessionId;
+						}
+					else
+						{
+						printf ("cannot add entry to ipv6 fragment table\n");
+						}
+					}
+				else
+					{
+					//it is an ipv4 fragment
+                                        bzero ( &fragKeyV4, sizeof (fragKeyV4));
+                                        fragKeyV4.fragId = pFragIdHashObject->fragId;
+                                        fragKeyV4.ip_addr = pFragIdHashObject->ipV4DstAddr;
+
+                                        ret = rte_hash_add_key (pIpV4FragIdHashTable, &fragKeyV4);
+                                        if (ret > 0)
+                                                {
+                                                ipV4fragIdHashTable[ret].fragId = fragKeyV4.fragId;
+                                                ipV4fragIdHashTable[ret].sessionId = pFragIdHashObject->sessionId;
+                                                }
+                                        else
+                                                {
+                                                printf ("cannot add entry to ipv4 fragment table\n");
+                                                }
+					}	
+				}
+			}
+
+		if (pControlRing != NULL )
+			{
+			//...ring exists, continue
+			//rte_ring_dump(pControlRing);
+			//calculateTimeStamp(&currentTime);
+			ret = rte_ring_dequeue ( pControlRing, (void **)pTest);
+			pHashObject = NULL;
+			if (ret == 0 )
+				{
+				printf ("sks: ...........................pControlRing dequeue successful ring count %d time 0x%x.0x%x\n", rte_ring_count (pControlRing));
+				pHashObject = (struct sessionIdIpV4HashObject *)pTest[0];
+				printf ("sks:addDeleteFlag = 0x%x\n", (int)(pHashObject->addDeleteFlag));
+				}
+			if (pHashObject )
+				{
                                 if ((int)(pHashObject->addDeleteFlag) == ADD_BEARER_GTPV2_SESSION)
                                         {
                                         key.ip_dst = pHashObject->ipControl;
                                         key.teid   = pHashObject->controlTeid;
-                                        ret = rte_hash_lookup (pSessionIdV6GtpV2ControlHashTable, &key);
+                                        ret = rte_hash_lookup (pSessionIdV4GtpV2ControlHashTable, &key);
 
                                         if (ret < 0 )
                                                 {
@@ -3366,33 +4292,31 @@ sessionIdHashTableMaint ( void )
                                                                         else
                                                                                 {
                                                                                 printf ("sks: cannot allocate bearer \n");
-                                                                                continue;
                                                                                 }
                                                                         }
                                                                 //...add it to the userplane hashtable first and then to the bearer list in the control plane hashtable.
-                                                                keyV6.teid = pHashObjectV6->dataTeid;
-                                                                keyV6.ip_dst[0] = pHashObjectV6->ipUser[0];
+                                                                keyV6.teid = pHashObject->dataTeid;
+                                                                keyV6.ip_dst[0] = pHashObject->ipUserV6[0];
 
-                                                                keyV6.ip_dst[1] = pHashObjectV6->ipUser[1];
-                                                                keyV6.ip_dst[2] = pHashObjectV6->ipUser[2];
-                                                                keyV6.ip_dst[3] = pHashObjectV6->ipUser[3];
+                                                                keyV6.ip_dst[1] = pHashObject->ipUserV6[1];
+                                                                keyV6.ip_dst[2] = pHashObject->ipUserV6[2];
+                                                                keyV6.ip_dst[3] = pHashObject->ipUserV6[3];
                                                                 /*printf ("sks adding UP key: pad0=0x%x,pad1=0x%x,pad2=0x%x,ip_src=0x%x,ip_dst=0x%x,pad3=0x%x,pad4=0x%x,pad5=0x%x,pad6=0x%x,flags=0x%x,teid=0x%x,pad7=0x%x\n",
                                                                 key.pad0,key.pad1,key.pad2,key.ip_src,key.ip_dst,key.pad3,key.pad4,key.pad5,key.pad6,key.flagsMsgTypeAndLen,key.teid,key.pad7);*/
                                                                 ret = rte_hash_add_key (pSessionIdV6UserHashTable, &keyV6);
                                                                 if (ret > 0 )
                                                                         {
-                                                                        sessionIdUserHashTableIPV6[ret].ipUserV6[0] = pHashObjectV6->ipUser[0];
-                                                                        sessionIdUserHashTableIPV6[ret].ipUserV6[1] = pHashObjectV6->ipUser[1];
-                                                                        sessionIdUserHashTableIPV6[ret].ipUserV6[2] = pHashObjectV6->ipUser[2];
-                                                                        sessionIdUserHashTableIPV6[ret].ipUserV6[3] = pHashObjectV6->ipUser[3];
-                                                                        sessionIdUserHashTableIPV6[ret].userTeid   = pHashObjectV6->dataTeid;
-                                                                        sessionIdUserHashTableIPV6[ret].sessionId = pHashObjectV6->sessionId;
+                                                                        sessionIdUserHashTableIPV6[ret].ipUserV6[0] = pHashObject->ipUserV6[0];
+                                                                        sessionIdUserHashTableIPV6[ret].ipUserV6[1] = pHashObject->ipUserV6[1];
+                                                                        sessionIdUserHashTableIPV6[ret].ipUserV6[2] = pHashObject->ipUserV6[2];
+                                                                        sessionIdUserHashTableIPV6[ret].ipUserV6[3] = pHashObject->ipUserV6[3];
+                                                                        sessionIdUserHashTableIPV6[ret].userTeid   = pHashObject->dataTeid;
+                                                                        sessionIdUserHashTableIPV6[ret].sessionId = pHashObject->sessionId;
                                                                         sessionIdUserHashTableIPV6[ret].outputInterface = lastInterfaceUsed;
                                                                         }
                                                                 else
                                                                         {
                                                                         printf ("cannot add key to user hash table\n");
-                                                                        continue;
                                                                         }
                                                                 }
 
@@ -3418,7 +4342,7 @@ sessionIdHashTableMaint ( void )
                                                                         if (pBearer != NULL)
                                                                                 {
                                                                                 pBearer->pNextBearer = NULL;
-                                                                                pBearer->ipV4User = pHashObjectV6->ipUserV4;
+                                                                                pBearer->ipV4User = pHashObject->ipUser;
                                                                                 pBearer->ipV6User[0]=0x0;
                                                                                 pBearer->ipV6User[1]=0x0;
                                                                                 pBearer->ipV6User[2]=0x0;
@@ -3429,7 +4353,6 @@ sessionIdHashTableMaint ( void )
                                                                         else
                                                                                 {
                                                                                 printf ("sks: cannot allocate bearer \n");
-                                                                                continue;
                                                                                 }
                                                                         }
                                                                 //...add it to the userplane hashtable first and then to the bearer list in the control plane hashtable.
@@ -3440,15 +4363,14 @@ sessionIdHashTableMaint ( void )
                                                                 ret = rte_hash_add_key (pSessionIdV4UserHashTable, &key);
                                                                 if (ret > 0 )
                                                                         {
-                                                                        sessionIdUserHashTableIPV4[ret].ipUser = pHashObjectV6->ipUser[0];
-                                                                        sessionIdUserHashTableIPV4[ret].userTeid   = pHashObjectV6->dataTeid;
-                                                                        sessionIdUserHashTableIPV4[ret].sessionId = pHashObjectV6->sessionId;
+                                                                        sessionIdUserHashTableIPV4[ret].ipUser = pHashObject->ipUser;
+                                                                        sessionIdUserHashTableIPV4[ret].userTeid   = pHashObject->dataTeid;
+                                                                        sessionIdUserHashTableIPV4[ret].sessionId = pHashObject->sessionId;
                                                                         sessionIdUserHashTableIPV4[ret].outputInterface = lastInterfaceUsed;
                                                                         }
                                                                 else
                                                                         {
                                                                         printf ("cannot add key to user hash table\n");
-                                                                        continue;
                                                                         }
                                                                 }
                                                         }
@@ -3459,7 +4381,7 @@ sessionIdHashTableMaint ( void )
                                         {
                                         //...first create the entry in the control hash table
                                         key.ip_dst = pHashObject->ipControl;
-                                        keyV6.teid   = pHashObject->controlTeid;
+                                        key.teid   = pHashObject->controlTeid;
                                         /*printf ("sks adding CP key: pad0=0x%x,pad1=0x%x,pad2=0x%x,ip_src=0x%x,ip_dst=0x%x,pad3=0x%x,pad4=0x%x,pad5=0x%x,pad6=0x%x,flags=0x%x,teid=0x%x,pad7=0x%x\n",
                                                 key.pad0,key.pad1,key.pad2,key.ip_src,key.ip_dst,key.pad3,key.pad4,key.pad5,key.pad6,key.flagsMsgTypeAndLen,key.teid,key.pad7);*/
 
@@ -3510,13 +4432,13 @@ sessionIdHashTableMaint ( void )
 								else
 									{
 									printf ("cannot add key to user hash table\n");
-									continue;
 									}
 								}
 							}
 						}
                                         if ((int)(pHashObject->addDeleteFlag) == ADD_GTPV2_SESSION)
                                                 {
+						printf ("sks:TblMaint: adding gtpv2 ipv4 session to v4 control hash table ip=0x%x, teid=0x%x\n", key.ip_dst,key.teid);
                                                 ret = rte_hash_add_key (pSessionIdV4GtpV2ControlHashTable, &key);
                                                 if(ret >= 0 )
                                                         {
@@ -3527,12 +4449,12 @@ sessionIdHashTableMaint ( void )
                                                         if (sessionIdControlHashTableIPV4GTPV2[ret].pBearerList)
                                                                 {
                                                                 //blindly copy the ips, since the appropriate ip addr is zeroed out on the sending lcore
-                                                                sessionIdControlHashTableIPV4GTPV2[ret].pBearerList->ipV6User[0]        = pHashObjectV6->ipUser[0];
-                                                                sessionIdControlHashTableIPV4GTPV2[ret].pBearerList->ipV6User[1]        = pHashObjectV6->ipUser[1];
-                                                                sessionIdControlHashTableIPV4GTPV2[ret].pBearerList->ipV6User[2]        = pHashObjectV6->ipUser[2];
-                                                                sessionIdControlHashTableIPV4GTPV2[ret].pBearerList->ipV6User[3]        = pHashObjectV6->ipUser[3];
-                                                                sessionIdControlHashTableIPV4GTPV2[ret].pBearerList->ipV4User           = pHashObjectV6->ipUserV4;
-                                                                sessionIdControlHashTableIPV4GTPV2[ret].pBearerList->userTeid           = pHashObjectV6->dataTeid;
+                                                                sessionIdControlHashTableIPV4GTPV2[ret].pBearerList->ipV6User[0]        = pHashObject->ipUserV6[0];
+                                                                sessionIdControlHashTableIPV4GTPV2[ret].pBearerList->ipV6User[1]        = pHashObject->ipUserV6[1];
+                                                                sessionIdControlHashTableIPV4GTPV2[ret].pBearerList->ipV6User[2]        = pHashObject->ipUserV6[2];
+                                                                sessionIdControlHashTableIPV4GTPV2[ret].pBearerList->ipV6User[3]        = pHashObject->ipUserV6[3];
+                                                                sessionIdControlHashTableIPV4GTPV2[ret].pBearerList->ipV4User           = pHashObject->ipUser;
+                                                                sessionIdControlHashTableIPV4GTPV2[ret].pBearerList->userTeid           = pHashObject->dataTeid;
                                                                 sessionIdControlHashTableIPV4GTPV2[ret].pBearerList->pNextBearer        = NULL;
                                                                 }
 
@@ -3572,7 +4494,6 @@ sessionIdHashTableMaint ( void )
                                                                         else
                                                                                 {
                                                                                 printf ("cannot add key to user hash table\n");
-                                                                                continue;
                                                                                 }
                                                                         }
                                                                 else
@@ -3594,7 +4515,6 @@ sessionIdHashTableMaint ( void )
                                                                         else
                                                                                 {
                                                                                 printf ("cannot add key to user hash table\n");
-                                                                                continue;
                                                                                 }
                                                                         }
                                                                 }
@@ -3607,9 +4527,53 @@ sessionIdHashTableMaint ( void )
 
 					}
 
+                                if ((int)(pHashObject->addDeleteFlag) == RELEASE_BEARER_GTPV2_SESSION )
+                                        {
+                                        printf ("sks: ipv4 gtpv2 release bearer msg addDeleteFlag = 0x%x\n", pHashObject->addDeleteFlag);
+                                        key.ip_dst 	= pHashObject->ipControl;
+                                        key.teid      	= pHashObject->controlTeid;
+
+                                        ret = rte_hash_del_key (pSessionIdV4GtpV2ControlHashTable,&key);
+
+                                        if (ret >= 0 )
+                                                {
+                                                pBearer = sessionIdControlHashTableIPV4GTPV2[ret].pBearerList;
+
+                                                while (pBearer)
+                                                        {
+                                                        //...run thru the bearer list and delete all bearer channels
+                                                        if (pBearer->ipV4User == 0x0)
+                                                                {
+                                                                //...ipv6 bearer
+                                                                keyV6.teid      = pBearer->userTeid;
+                                                                keyV6.ip_dst[0] = pBearer->ipV6User[0];
+                                                                keyV6.ip_dst[1] = pBearer->ipV6User[1];
+                                                                keyV6.ip_dst[2] = pBearer->ipV6User[2];
+                                                                keyV6.ip_dst[3] = pBearer->ipV6User[3];
+                                                                rte_hash_del_key ( pSessionIdV6UserHashTable, &keyV6);
+                                                                }
+                                                        else
+                                                                {
+                                                                //...ipv4 bearer, reuse the key
+                                                                key.teid        = pBearer->userTeid;
+                                                                key.ip_dst      = pBearer->ipV4User;
+                                                                rte_hash_del_key (pSessionIdV4UserHashTable, &key);
+                                                                }
+                                                        pBearer = pBearer->pNextBearer;
+                                                        }
+                                                sessionIdControlHashTableIPV4GTPV2[ret].ipControl         = 0x0;
+                                                sessionIdControlHashTableIPV4GTPV2[ret].pBearerList          = NULL;
+                                                sessionIdControlHashTableIPV4GTPV2[ret].controlTeid          = 0x0;
+                                                sessionIdControlHashTableIPV4GTPV2[ret].sessionId            = 0x0;
+                                                sessionIdControlHashTableIPV4GTPV2[ret].outputInterface      = 0x0;
+                                                }
+
+                                        }
+
+
 				if (((int)(pHashObject->addDeleteFlag) == DELETE_GTPV1_SESSION_NO_TEARDOWN)||((int)(pHashObject->addDeleteFlag) == DELETE_GTPV1_SESSION_TEARDOWN ))
 					{
-					printf ("sks: dequeued delete msg\n");
+					printf ("sks: ip v4  gtpv1 dequeued delete msg\n");
                                         key.ip_dst = pHashObject->ipControl;
                                         key.teid   = pHashObject->controlTeid;
                                         printf ("sks deleting CP key: pad0=0x%x,pad1=0x%x,pad2=0x%x,ip_src=0x%x,ip_dst=0x%x,pad3=0x%x,pad4=0x%x,pad5=0x%x,pad6=0x%x,flags=0x%x,teid=0x%x,pad7=0x%x\n",
@@ -3643,17 +4607,21 @@ sessionIdHashTableMaint ( void )
                                                         else
                                                                 {
                                                                 printf ("cannot add key to user hash table\n");
-                                                                continue;
                                                                 }
                                                         }
                                                 }
 					}
 				}
+			}
 
-                        if (pControlRingV6 != NULL )
-                                {
+                if (pControlRingV6 != NULL )
+                        {
                                 //...ring exists, continue
                                 //rte_ring_dump(pControlRing);
+                                if (rte_ring_count (pControlRingV6) > 0)
+					{
+					printf ("SKS: ring has data\n");
+					}
                                 ret = rte_ring_dequeue ( pControlRingV6, (void **)pTest);
                                 if (ret == 0 )
                                         {
@@ -3672,6 +4640,7 @@ sessionIdHashTableMaint ( void )
                                         continue;
                                         }
 
+			 	printf ("addflag=0x%x,ipuserV4=0x%x\n", pHashObjectV6->addDeleteFlag,pHashObjectV6->ipUserV4);	
                                 if ((int)(pHashObjectV6->addDeleteFlag) == ADD_BEARER_GTPV2_SESSION)
 					{
                                         keyV6.ip_dst[0] = pHashObjectV6->ipControl[0];
@@ -3683,13 +4652,15 @@ sessionIdHashTableMaint ( void )
 
 					if (ret < 0 )
 						{
-						printf ("sks: no session established for bearer update\n");
+						printf ("sks: no session established for bearer update ipdst=0x%x:0x%x:0x%x:0x%x, ctrlTeid=0x%x\n",
+						keyV6.ip_dst[0], keyV6.ip_dst[1], keyV6.ip_dst[2], keyV6.ip_dst[3], keyV6.teid);
 						}
 					if (ret > 0 )
 						{
 					        if (pHashObjectV6->ipUserV4 == 0x0)
 							{
 							//...ipv6 bearer
+							printf ("sks:sessionMaint: gtpv2 add ipv6 bearer request\n");
                                                         if (pHashObjectV6->dataTeid)
                                                                 {
 								if (sessionIdControlHashTableIPV6GTPV2[ret].pBearerList != NULL )
@@ -3726,9 +4697,10 @@ sessionIdHashTableMaint ( void )
                                                                 keyV6.ip_dst[1] = pHashObjectV6->ipUser[1];
                                                                 keyV6.ip_dst[2] = pHashObjectV6->ipUser[2];
                                                                 keyV6.ip_dst[3] = pHashObjectV6->ipUser[3];
-                                                                /*printf ("sks adding UP key: pad0=0x%x,pad1=0x%x,pad2=0x%x,ip_src=0x%x,ip_dst=0x%x,pad3=0x%x,pad4=0x%x,pad5=0x%x,pad6=0x%x,flags=0x%x,teid=0x%x,pad7=0x%x\n",
-                                                                key.pad0,key.pad1,key.pad2,key.ip_src,key.ip_dst,key.pad3,key.pad4,key.pad5,key.pad6,key.flagsMsgTypeAndLen,key.teid,key.pad7);*/
-                                                                ret = rte_hash_add_key (pSessionIdV6UserHashTable, &keyV6);
+                                                                printf ("sks adding UP bearer key: pad0=0x%x,pad1=0x%x,pad2=0x%x,ip_src=0x%x,ip_dst=0x%x:0x%x:0x%x:0x%x,pad3=0x%x,pad4=0x%x,pad5=0x%x,pad6=0x%x,flags=0x%x,teid=0x%x\n",
+                                                                        keyV6.pad0,keyV6.pad1,keyV6.pad2,keyV6.ip_src[0],keyV6.ip_dst[0],keyV6.ip_dst[1],keyV6.ip_dst[2],keyV6.ip_dst[3],keyV6.pad3,keyV6.pad4,keyV6.pad5,keyV6.pad6,keyV6.flagsMsgTypeAndLen,keyV6.teid);
+ 
+								ret = rte_hash_add_key (pSessionIdV6UserHashTable, &keyV6);
                                                                 if (ret > 0 )
                                                                         {
                                                                         sessionIdUserHashTableIPV6[ret].ipUserV6[0] = pHashObjectV6->ipUser[0];
@@ -3750,6 +4722,7 @@ sessionIdHashTableMaint ( void )
 						else
 							{
 							//...ipv4 bearer
+							printf ("sks:sessionMaint: gtpv2 add ipv4 bearer request\n");
 
                                                         if (pHashObjectV6->dataTeid)
                                                                 {
@@ -3784,8 +4757,8 @@ sessionIdHashTableMaint ( void )
                                                                 //...add it to the userplane hashtable first and then to the bearer list in the control plane hashtable.
                                                                 key.teid = pHashObjectV6->dataTeid;
                                                                 key.ip_dst = pHashObjectV6->ipUserV4;
-                                                                /*printf ("sks adding UP key: pad0=0x%x,pad1=0x%x,pad2=0x%x,ip_src=0x%x,ip_dst=0x%x,pad3=0x%x,pad4=0x%x,pad5=0x%x,pad6=0x%x,flags=0x%x,teid=0x%x,pad7=0x%x\n",
-                                                                key.pad0,key.pad1,key.pad2,key.ip_src,key.ip_dst,key.pad3,key.pad4,key.pad5,key.pad6,key.flagsMsgTypeAndLen,key.teid,key.pad7);*/
+                                                                printf ("sks adding UP key: pad0=0x%x,pad1=0x%x,pad2=0x%x,ip_src=0x%x,ip_dst=0x%x,pad3=0x%x,pad4=0x%x,pad5=0x%x,pad6=0x%x,flags=0x%x,teid=0x%x,pad7=0x%x\n",
+                                                                key.pad0,key.pad1,key.pad2,key.ip_src,key.ip_dst,key.pad3,key.pad4,key.pad5,key.pad6,key.flagsMsgTypeAndLen,key.teid,key.pad7);
                                                                 ret = rte_hash_add_key (pSessionIdV4UserHashTable, &key);
                                                                 if (ret > 0 )
                                                                         {
@@ -3811,8 +4784,8 @@ sessionIdHashTableMaint ( void )
                                         keyV6.ip_dst[2] = pHashObjectV6->ipControl[2];
                                         keyV6.ip_dst[3] = pHashObjectV6->ipControl[3];
                                         keyV6.teid   = pHashObjectV6->controlTeid;
-                                        /*printf ("sks adding CP key: pad0=0x%x,pad1=0x%x,pad2=0x%x,ip_src=0x%x,ip_dst=0x%x,pad3=0x%x,pad4=0x%x,pad5=0x%x,pad6=0x%x,flags=0x%x,teid=0x%x,pad7=0x%x\n",
-                                                key.pad0,key.pad1,key.pad2,key.ip_src,key.ip_dst,key.pad3,key.pad4,key.pad5,key.pad6,key.flagsMsgTypeAndLen,key.teid,key.pad7);*/
+                                        printf ("sks adding CP key: pad0=0x%x,pad1=0x%x,pad2=0x%x,ip_src=0x%x,ip_dst=0x%x:0x%x:0x%x:0x%x,pad3=0x%x,pad4=0x%x,pad5=0x%x,pad6=0x%x,flags=0x%x,teid=0x%x\n",
+                                                keyV6.pad0,keyV6.pad1,keyV6.pad2,keyV6.ip_src[0],keyV6.ip_dst[0],keyV6.ip_dst[1],keyV6.ip_dst[2],keyV6.ip_dst[3],keyV6.pad3,keyV6.pad4,keyV6.pad5,keyV6.pad6,keyV6.flagsMsgTypeAndLen,keyV6.teid);
                                         if ((int)(pHashObjectV6->addDeleteFlag) == ADD_GTPV1_SESSION)
 						{
 						ret = rte_hash_add_key (pSessionIdV6ControlHashTable, &keyV6);
@@ -3846,9 +4819,10 @@ sessionIdHashTableMaint ( void )
                                                         	keyV6.ip_dst[1] = pHashObjectV6->ipUser[1];
                                                         	keyV6.ip_dst[2] = pHashObjectV6->ipUser[2];
                                                         	keyV6.ip_dst[3] = pHashObjectV6->ipUser[3];
-                                                        	/*printf ("sks adding UP key: pad0=0x%x,pad1=0x%x,pad2=0x%x,ip_src=0x%x,ip_dst=0x%x,pad3=0x%x,pad4=0x%x,pad5=0x%x,pad6=0x%x,flags=0x%x,teid=0x%x,pad7=0x%x\n",
-                                                        	key.pad0,key.pad1,key.pad2,key.ip_src,key.ip_dst,key.pad3,key.pad4,key.pad5,key.pad6,key.flagsMsgTypeAndLen,key.teid,key.pad7);*/
-                                                        	ret = rte_hash_add_key (pSessionIdV6UserHashTable, &keyV6);
+                                                                printf ("sks adding UP key: pad0=0x%x,pad1=0x%x,pad2=0x%x,ip_src=0x%x,ip_dst=0x%x:0x%x:0x%x:0x%x,pad3=0x%x,pad4=0x%x,pad5=0x%x,pad6=0x%x,flags=0x%x,teid=0x%x\n",
+      		                                                keyV6.pad0,keyV6.pad1,keyV6.pad2,keyV6.ip_src[0],keyV6.ip_dst[0],keyV6.ip_dst[1],keyV6.ip_dst[2],keyV6.ip_dst[3],keyV6.pad3,keyV6.pad4,keyV6.pad5,keyV6.pad6,keyV6.flagsMsgTypeAndLen,keyV6.teid);
+	
+								ret = rte_hash_add_key (pSessionIdV6UserHashTable, &keyV6);
                                                         	if (ret > 0 )
                                                                 	{
                                                                 	sessionIdUserHashTableIPV6[ret].ipUserV6[0] = pHashObjectV6->ipUser[0];
@@ -3870,6 +4844,7 @@ sessionIdHashTableMaint ( void )
 
 					if ((int)(pHashObjectV6->addDeleteFlag) == ADD_GTPV2_SESSION)
 						{
+						printf ("sks: ading gpv2 ipv6 control hash\n");
 						ret = rte_hash_add_key (pSessionIdV6GtpV2ControlHashTable, &keyV6);
                                                 if(ret >= 0 )
                                                         {
@@ -3906,14 +4881,17 @@ sessionIdHashTableMaint ( void )
                                                         if (pHashObjectV6->dataTeid)
                                                                 {
                                                                 keyV6.teid = pHashObjectV6->dataTeid;
+								printf ("sks: ipUserV4=0x%x\n", pHashObjectV6->ipUserV4);
 								if (pHashObjectV6->ipUserV4 == 0x0)
 									{
                                                                 	keyV6.ip_dst[0] = pHashObjectV6->ipUser[0];
                                                                 	keyV6.ip_dst[1] = pHashObjectV6->ipUser[1];
                                                                 	keyV6.ip_dst[2] = pHashObjectV6->ipUser[2];
                                                                 	keyV6.ip_dst[3] = pHashObjectV6->ipUser[3];
-                                                                	/*printf ("sks adding UP key: pad0=0x%x,pad1=0x%x,pad2=0x%x,ip_src=0x%x,ip_dst=0x%x,pad3=0x%x,pad4=0x%x,pad5=0x%x,pad6=0x%x,flags=0x%x,teid=0x%x,pad7=0x%x\n",
-                                                                	key.pad0,key.pad1,key.pad2,key.ip_src,key.ip_dst,key.pad3,key.pad4,key.pad5,key.pad6,key.flagsMsgTypeAndLen,key.teid,key.pad7);*/
+				                                        printf ("sks adding v6 UP key: pad0=0x%x,pad1=0x%x,pad2=0x%x,ip_src=0x%x,ip_dst=0x%x:0x%x:0x%x:0x%x,pad3=0x%x,pad4=0x%x,pad5=0x%x,pad6=0x%x,flags=0x%x,teid=0x%x\n",
+                               			                        keyV6.pad0,keyV6.pad1,keyV6.pad2,keyV6.ip_src[0],keyV6.ip_dst[0],keyV6.ip_dst[1],keyV6.ip_dst[2],keyV6.ip_dst[3],keyV6.pad3,keyV6.pad4,keyV6.pad5,keyV6.pad6,keyV6.flagsMsgTypeAndLen,keyV6.teid);
+
+									printf ("sks: ading gpv2 ipv6 user hash\n");
                                                                 	ret = rte_hash_add_key (pSessionIdV6UserHashTable, &keyV6);
                                                                 	if (ret > 0 )
                                                                         	{
@@ -3937,14 +4915,15 @@ sessionIdHashTableMaint ( void )
 							
 		                                                        key.teid = pHashObjectV6->dataTeid;
                			                                        key.ip_dst = pHashObjectV6->ipUserV4;
-                                                        		//printf ("sks adding UP key: pad0=0x%x,pad1=0x%x,pad2=0x%x,ip_src=0x%x,ip_dst=0x%x,pad3=0x%x,pad4=0x%x,pad5=0x%x,pad6=0x%x,flags=0x%x,teid=0x%x,pad7=0x%x\n",
-                                                        		//key.pad0,key.pad1,key.pad2,key.ip_src,key.ip_dst,key.pad3,key.pad4,key.pad5,key.pad6,key.flagsMsgTypeAndLen,key.teid,key.pad7);
-                                                        		ret = rte_hash_add_key (pSessionIdV4UserHashTable, &key);
+                             	                                        printf ("sks adding v4 UP key: ip_dst=0x%x,teid=0x%x\n",
+       				                                        key.ip_dst,key.teid);
+	
+									ret = rte_hash_add_key (pSessionIdV4UserHashTable, &key);
                                                         		if (ret > 0 )
                                                                 		{
-                                                                		sessionIdUserHashTableIPV4[ret].ipUser = pHashObject->ipUser;
-                                                                		sessionIdUserHashTableIPV4[ret].userTeid   = pHashObject->dataTeid;
-                                                                		sessionIdUserHashTableIPV4[ret].sessionId = pHashObject->sessionId;
+                                                                		sessionIdUserHashTableIPV4[ret].ipUser = pHashObjectV6->ipUserV4;
+                                                                		sessionIdUserHashTableIPV4[ret].userTeid   = pHashObjectV6->dataTeid;
+                                                                		sessionIdUserHashTableIPV4[ret].sessionId = pHashObjectV6->sessionId;
                                                                 		sessionIdUserHashTableIPV4[ret].outputInterface = lastInterfaceUsed;
                                                                 		}
                                                         		else
@@ -3962,14 +4941,63 @@ sessionIdHashTableMaint ( void )
 						}
                                         }
 
-                                if (((int)(pHashObjectV6->addDeleteFlag) == DELETE_GTPV1_SESSION_NO_TEARDOWN)||((int)(pHashObjectV6->addDeleteFlag) == DELETE_GTPV1_SESSION_TEARDOWN ))
-                                        {
-                                        printf ("sks: dequeued delete msg\n");
+                                if ((int)(pHashObjectV6->addDeleteFlag) == RELEASE_BEARER_GTPV2_SESSION )
+					{
+                                        printf ("sks: ipv6 gtpv2 release bearer msg addDeleteFlag = 0x%x\n", pHashObjectV6->addDeleteFlag);
                                         keyV6.ip_dst[0] = pHashObjectV6->ipControl[0];
                                         keyV6.ip_dst[1] = pHashObjectV6->ipControl[1];
                                         keyV6.ip_dst[2] = pHashObjectV6->ipControl[2];
                                         keyV6.ip_dst[3] = pHashObjectV6->ipControl[3];
-                                        keyV6.teid   	= pHashObject->controlTeid;
+                                        keyV6.teid      = pHashObjectV6->controlTeid;
+
+					ret = rte_hash_del_key (pSessionIdV6GtpV2ControlHashTable,&keyV6);
+
+					if (ret >= 0 )
+						{
+						pBearer = sessionIdControlHashTableIPV6GTPV2[ret].pBearerList;
+
+						while (pBearer)
+							{
+							printf ("sks: deleting bearer channel\n");
+							//...run thru the bearer list and delete all bearer channels	
+							if (pBearer->ipV4User == 0x0)
+								{
+								//...ipv6 bearer
+								keyV6.teid	= pBearer->userTeid;
+								keyV6.ip_dst[0] = pBearer->ipV6User[0];
+								keyV6.ip_dst[1] = pBearer->ipV6User[1];
+								keyV6.ip_dst[2] = pBearer->ipV6User[2];
+								keyV6.ip_dst[3] = pBearer->ipV6User[3];
+								rte_hash_del_key ( pSessionIdV6UserHashTable, &keyV6);
+								}
+							else
+								{
+								//...ipv4 bearer
+								key.teid	= pBearer->userTeid;
+								key.ip_dst	= pBearer->ipV4User;
+								rte_hash_del_key (pSessionIdV4UserHashTable, &key);
+								}
+							pBearer = pBearer->pNextBearer;
+							}
+                                                sessionIdControlHashTableIPV6GTPV2[ret].ipControl[0]         = 0x0;
+                                                sessionIdControlHashTableIPV6GTPV2[ret].ipControl[1]         = 0x0;
+                                                sessionIdControlHashTableIPV6GTPV2[ret].ipControl[2]         = 0x0;
+                                                sessionIdControlHashTableIPV6GTPV2[ret].ipControl[3]         = 0x0;
+                                                sessionIdControlHashTableIPV6GTPV2[ret].pBearerList          = NULL; 
+                                                sessionIdControlHashTableIPV6GTPV2[ret].controlTeid          = 0x0;
+                                                sessionIdControlHashTableIPV6GTPV2[ret].sessionId            = 0x0;
+                                                sessionIdControlHashTableIPV6GTPV2[ret].outputInterface      = 0x0;
+						}
+					
+					}
+                                if (((int)(pHashObjectV6->addDeleteFlag) == DELETE_GTPV1_SESSION_NO_TEARDOWN)||((int)(pHashObjectV6->addDeleteFlag) == DELETE_GTPV1_SESSION_TEARDOWN ))
+                                        {
+                                        printf ("sks: ipv6 gtpv1 dequeued delete msg addDeleteFlag = 0x%x\n", pHashObjectV6->addDeleteFlag);
+                                        keyV6.ip_dst[0] = pHashObjectV6->ipControl[0];
+                                        keyV6.ip_dst[1] = pHashObjectV6->ipControl[1];
+                                        keyV6.ip_dst[2] = pHashObjectV6->ipControl[2];
+                                        keyV6.ip_dst[3] = pHashObjectV6->ipControl[3];
+                                        keyV6.teid   	= pHashObjectV6->controlTeid;
                                         /*printf ("sks deleting CP key: pad0=0x%x,pad1=0x%x,pad2=0x%x,ip_src=0x%x,ip_dst=0x%x,pad3=0x%x,pad4=0x%x,pad5=0x%x,pad6=0x%x,flags=0x%x,teid=0x%x,pad7=0x%x\n",
                                                 key.pad0,key.pad1,key.pad2,key.ip_src,key.ip_dst,key.pad3,key.pad4,key.pad5,key.pad6,key.flagsMsgTypeAndLen,key.teid,key.pad7);*/
                                         ret = rte_hash_del_key (pSessionIdV6ControlHashTable, &keyV6);
@@ -4019,6 +5047,10 @@ sessionIdHashTableMaint ( void )
                                                 }
                                         }
 				}
+			else
+				{
+				printf ("sks:pControlV6 is NULL!!!\n");
+				}
 		}
 	}
 static int
@@ -4027,6 +5059,7 @@ l2fwd_launch_one_lcore(__attribute__((unused)) void *dummy)
 	unsigned lcore_id;
 	lcore_id = rte_lcore_id();
 	printf ("sks, lcoreid=%u\n", lcore_id);
+
 	
 	if ( lcore_id == 0x01 )
 		l2fwd_main_loop();
@@ -4349,12 +5382,29 @@ MAIN(int argc, char **argv)
 
 		/* init one RX queue */
 		fflush(stdout);
-		ret = rte_eth_rx_queue_setup(portid, 0, nb_rxd,
+		/*ret = rte_eth_rx_queue_setup(portid, 0, nb_rxd,
 					     rte_eth_dev_socket_id(portid), &rx_conf,
 					     l2fwd_pktmbuf_pool);
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d, port=%u\n",
-				  ret, (unsigned) portid);
+				  ret, (unsigned) portid);*/
+
+		//...setup 5 rx queues
+
+		int queueNum = 0;
+		while (queueNum <1)
+			{
+			printf ("sks: setting up queueNum %d on port %d\n", queueNum, portid);
+			ret = rte_eth_rx_queue_setup(portid, queueNum, nb_rxd,
+                       		                      rte_eth_dev_socket_id(portid), &rx_conf,
+                               		              l2fwd_pktmbuf_pool);
+                	if (ret < 0)
+                        	rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d, port=%u\n",
+                                  	ret, (unsigned) portid);
+			queueNum++;
+			}
+
+
 
 		/* init one TX queue on each port */
 		fflush(stdout);
@@ -4403,3 +5453,8 @@ MAIN(int argc, char **argv)
 
 	return 0;
 }
+
+
+
+
+
